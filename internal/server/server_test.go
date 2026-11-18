@@ -24,6 +24,7 @@ func startTestServer(t *testing.T) (*Server, config.Config) {
 	cfg.Dir = t.TempDir()
 	cfg.Readers = 2
 	cfg.Writers = 2
+	cfg.RcvBuf = 256 << 10 // like an untuned CI runner; send() must cope with it
 	cfg.StatsInterval = 0
 	srv, err := Start(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -32,11 +33,18 @@ func startTestServer(t *testing.T) (*Server, config.Config) {
 	return srv, cfg
 }
 
-// send sends n numbered messages from source to dst, paced so that a small
-// default kernel receive buffer (as on CI runners) does not overflow.
-func send(t *testing.T, source string, dst *net.UDPAddr, start, n int) bool {
+// sendWindow is how many datagrams may be in flight before send waits for
+// the server to read them. It is far below what even a default ~208 KB
+// socket buffer holds, so the kernel never drops datagrams in tests, however
+// slow the machine is (CI runners with -race are 5-20x slower).
+const sendWindow = 100
+
+// send sends n numbered messages (seq=start..start+n-1) from source to the
+// server. After every sendWindow datagrams it waits until the server has
+// received all of them; the test fails if one does not arrive.
+func send(t *testing.T, srv *Server, source string, start, n int) bool {
 	t.Helper()
-	c, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(source)}, dst)
+	c, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(source)}, srv.Addr().(*net.UDPAddr))
 	if err != nil {
 		if source == "127.0.0.1" {
 			t.Fatal(err)
@@ -45,13 +53,27 @@ func send(t *testing.T, source string, dst *net.UDPAddr, start, n int) bool {
 		return false
 	}
 	defer c.Close()
-	for i := start; i < start+n; i++ {
-		fmt.Fprintf(c, "<134>1 2026-11-18T10:00:00Z host app - - - seq=%d\n", i)
-		if i%200 == 199 {
-			time.Sleep(time.Millisecond)
+	base := srv.Stats.Received.Load()
+	for sent := 0; sent < n; {
+		for end := min(sent+sendWindow, n); sent < end; sent++ {
+			if _, err := fmt.Fprintf(c, "<134>1 2026-11-18T10:00:00Z host app - - - seq=%d\n", start+sent); err != nil {
+				t.Fatal(err)
+			}
 		}
+		waitReceived(t, srv, base+uint64(sent))
 	}
 	return true
+}
+
+func waitReceived(t *testing.T, srv *Server, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.Stats.Received.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("datagrams lost: server received %d, sent %d", srv.Stats.Received.Load(), want)
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 // checkFile verifies that the sequence numbers in all hour files of dir are
@@ -92,32 +114,18 @@ func checkFile(t *testing.T, dir string) int {
 
 func TestEndToEnd(t *testing.T) {
 	srv, cfg := startTestServer(t)
-	dst := srv.Addr().(*net.UDPAddr)
 	const n = 20000
 
 	sources := []string{"127.0.0.1"}
-	if send(t, "127.0.0.1", dst, 0, n) && send(t, "127.0.0.2", dst, 0, n) {
+	if send(t, srv, "127.0.0.1", 0, n) && send(t, srv, "127.0.0.2", 0, n) {
 		sources = append(sources, "127.0.0.2") // Linux routes all of 127/8 to lo
 	}
 	want := uint64(n * len(sources))
-
-	// Wait until everything that arrived has been processed.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		st := srv.Stats.Snapshot()
-		if st.Received >= want {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	srv.Shutdown()
+	srv.Shutdown() // drains the writer queues
 
 	st := srv.Stats.Snapshot()
-	if st.Received < want*95/100 {
-		t.Fatalf("received only %d of %d datagrams", st.Received, want)
-	}
-	if st.Written+st.DroppedQueueFull != st.Received || st.WriteErrors != 0 {
-		t.Fatalf("inconsistent stats: %+v", st)
+	if st.Received != want || st.Written != want || st.DroppedQueueFull != 0 || st.WriteErrors != 0 {
+		t.Fatalf("want %d received and written without drops or errors, got %+v", want, st)
 	}
 	var total uint64
 	for _, src := range sources {
@@ -133,12 +141,9 @@ func TestEndToEnd(t *testing.T) {
 
 func TestReopenWhileRunning(t *testing.T) {
 	srv, cfg := startTestServer(t)
-	dst := srv.Addr().(*net.UDPAddr)
-	send(t, "127.0.0.1", dst, 0, 10)
-	time.Sleep(100 * time.Millisecond)
+	send(t, srv, "127.0.0.1", 0, 10)
 	srv.Reopen()
-	send(t, "127.0.0.1", dst, 10, 10)
-	time.Sleep(100 * time.Millisecond)
+	send(t, srv, "127.0.0.1", 10, 10)
 	srv.Shutdown()
 	if got := checkFile(t, filepath.Join(cfg.Dir, "127.0.0.1")); got != 20 {
 		t.Fatalf("got %d lines, want 20", got)
