@@ -2,10 +2,16 @@
 // does not allocate a fresh buffer for every datagram.
 package bufpool
 
-import "sync"
+import (
+	"sync"
+	"unsafe"
+)
 
 var classes = [...]int{256, 1024, 4096, 16384, 65536}
 
+// pools hold a pointer to the first byte of each free buffer. Storing that
+// pointer (instead of a *[]byte) lets Put return a buffer without allocating
+// a slice header on the heap for every message.
 var pools [len(classes)]sync.Pool
 
 // Get returns a slice of length n. Its capacity is the smallest size class
@@ -13,8 +19,8 @@ var pools [len(classes)]sync.Pool
 func Get(n int) []byte {
 	for i, c := range classes {
 		if n <= c {
-			if v, ok := pools[i].Get().(*[]byte); ok {
-				return (*v)[:n]
+			if p, ok := pools[i].Get().(*byte); ok {
+				return unsafe.Slice(p, c)[:n]
 			}
 			return make([]byte, n, c)
 		}
@@ -27,8 +33,7 @@ func Put(b []byte) {
 	c := cap(b)
 	for i, cl := range classes {
 		if c == cl {
-			b = b[:0]
-			pools[i].Put(&b)
+			pools[i].Put(unsafe.SliceData(b[:cl]))
 			return
 		}
 	}
