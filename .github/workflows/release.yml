@@ -60,10 +60,10 @@ jobs:
 
       - name: Import signing key (optional)
         env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
         run: |
-          if [ -z "$GPG_PRIVATE_KEY" ]; then
-            echo "::warning::GPG_PRIVATE_KEY secret not set: RPM and repository will be unsigned"
+          if [ -z "$PACKAGE_SIGNING_KEY" ]; then
+            echo "::warning::PACKAGE_SIGNING_KEY secret not set: RPM and repository will be unsigned"
             exit 0
           fi
           # Accepts the key ASCII-armored or base64 encoded; fails with a hint otherwise.
@@ -75,12 +75,12 @@ jobs:
 
       - name: Build RPM
         env:
-          NFPM_RPM_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          NFPM_RPM_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
         run: make rpm VERSION="$VERSION"
 
       - name: Assemble repository
         env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"
