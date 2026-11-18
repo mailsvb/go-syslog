@@ -21,13 +21,13 @@ These notes look at why rsyslog and syslog-ng are fast and reliable, and how eac
 ### What go-syslog adopts
 1. **`SO_RCVBUF` 32 MB** (configurable) on each socket, read back with `getsockopt`, and a warning logged if the kernel capped it. The RPM ships `/usr/lib/sysctl.d/90-go-syslog.conf` with `net.core.rmem_max=33554432`, so no `CAP_NET_ADMIN` is needed.
 2. **N receiver goroutines (default = min(NumCPU,4)), each with its own `SO_REUSEPORT` socket**, each locked to an OS thread (`runtime.LockOSThread`).
-3. **`recvmmsg` batching** via `golang.org/x/net/ipv4|ipv6.PacketConn.ReadBatch` (batch of 64, 64 KiB slots that are reused).
-4. **Minimal hot path:** read the batch, take one `time.Now()` per batch (rsyslog `timeRequery` idea), copy each payload into a buffer from a `sync.Pool` (the pool stores the buffer's base pointer, so returning a buffer does not allocate), normalise the source IP (IPv4-mapped → IPv4), then a non-blocking send to the writer shard picked by `fnv(ip) % W`.
-5. **Bounded queues with drop-and-count:** each writer shard has a buffered channel (default 65 536 msgs). When it is full the message is dropped and the `dropped_queue_full` counter goes up, like rsyslog's discard watermark. The reader never blocks, so overload is visible in the counters instead of hidden as kernel `RcvbufErrors`. The disk-assisted queue is out of scope and noted as a possible later addition.
+3. **`recvmmsg` batching** (batch of 64, 64 KiB slots that are reused). On Linux the reader calls `recvmmsg` itself and reads the sender straight from the `sockaddr` into a `netip.Addr`; `x/net`'s `ReadBatch` allocated a `net.IP` and a `*net.UDPAddr` per datagram. Other systems (development machines) still use `ReadBatch`.
+4. **Minimal hot path:** read the batch, take one `time.Now()` per batch (rsyslog `timeRequery` idea), copy each payload into a buffer from a `sync.Pool` (the pool stores the buffer's base pointer, so returning a buffer does not allocate), normalise the source IP (IPv4-mapped → IPv4), pick the writer shard by `fnv(ip) % W` and collect the message in a per-shard batch. After the `recvmmsg` call every shard gets its batch with **one** non-blocking channel send (rsyslog `dequeueBatchSize`, the other way round), so channel locking and goroutine wake-ups are paid per batch, not per message. Receiving and dispatching do not allocate.
+5. **Bounded queues with drop-and-count:** each writer shard has a queue (default 65 536 msgs in total). The limit is counted in messages: a reader reserves room before it sends a batch, and a batch that does not fit is dropped as a whole and counted in `dropped_queue_full`, like rsyslog's discard watermark. The reader never blocks, so overload is visible in the counters instead of hidden as kernel `RcvbufErrors`. The disk-assisted queue is out of scope and noted as a possible later addition.
 6. **Sharded writers (W goroutines, default NumCPU) owned by IP hash:** each IP has exactly one writer, so per-host order is kept and file handles need no locks.
-7. **Per-writer LRU file cache** (default 1024 open files per shard): `*os.File` + `bufio.Writer` (64 KiB). Flush happens when:
+7. **Per-writer LRU file cache** (default 1024 open files per shard): `*os.File` + `bufio.Writer` (64 KiB). The shard remembers the last written file, so a run of messages for the same file skips the map lookup. Written-message counters are kept per shard and added to the shared atomics once per batch, so the shards do not contend on one cache line. Flush happens when:
    - the buffer is full (automatic)
-   - the shard's queue has been drained (rsyslog `flushOnTXEnd`)
+   - the shard's queue has been drained (rsyslog `flushOnTXEnd`), at most every `-flush-min-interval` (100 ms). Without the limit, moderate traffic drains the queue after nearly every message and costs one `write(2)` per message; with it, a skipped flush is done by a timer when the interval is up. In a loopback test with 64 senders at 20 000 msgs/s, file writes dropped from 1 per message to 0.04 per message.
    - a 1 s ticker fires (`flushInterval` / `flush_timeout`)
    - the file rotates, is evicted, the process shuts down, or SIGHUP arrives.
    There is no fsync per message. The config offers optional `fsync on close/rotate`.
@@ -62,19 +62,44 @@ Measured on an Apple M-series machine:
              reader N ─┘
                  │  Message{ip, time, pooled []byte}
                  ▼  fnv(ip) % W, or fnv(ip, tag) % W for -split-by-tag senders
-                 │  (non-blocking; full queue → dropped_queue_full++)
+                 │  one batch per shard per recvmmsg call (non-blocking; full queue → dropped_queue_full += len)
           ┌─────────────┬─────────────┐
           │ shard 0 chan│ shard W chan│   bounded in-memory queues
           ▼             ▼             ▼
        writer 0  ...  writer W       one goroutine per shard, owns its files
           │  LRU cache: (ip, [tag,] UTC hour) → *os.File + 64 KiB bufio.Writer
-          │  flush: buffer full | queue drained | 1 s tick | rotate/evict/HUP/exit
+          │  flush: buffer full | queue drained (max every 100 ms) | 1 s tick | rotate/evict/HUP/exit
           ▼
    <dir>/<ip>/[<tag>/]<YYYY-MM-DD_HH>.log     "2026-11-18T13:04:05.123Z <raw message>"
 
    janitor (every 10 min): delete hour files older than the retention period, remove empty ip dirs
 ```
 
+## Measuring
+
+`BenchmarkEndToEnd` (`internal/server/bench_test.go`) sends datagrams over loopback through the whole server (sockets, readers, writer shards, files) and keeps at most 8192 in flight, so it measures how fast the server drains and writes, not how many datagrams the kernel drops. Run it on Linux:
+
+```bash
+go test -run x -bench EndToEnd -benchmem -cpuprofile cpu.out ./internal/server
+```
+
+On loopback the kernel's delivery work is billed to the senders, so ns/op mostly measures the sending side. The useful number is the server's share of the CPU profile (`receiver.(*Receiver).readLoop` + `writer.(*shard).run`) divided by the message count.
+
+Server CPU per message, Linux arm64 VM with 2 vCPUs, 2M messages of 112 bytes, mean of 3 runs:
+
+| | 1 sender IP | 64 sender IPs | allocations/msg |
+|---|---|---|---|
+| before the hot-path work | 440 ns | 410 ns | 2 |
+| writer quick wins | 430 ns | 395 ns | 2 |
+| own `recvmmsg` | 325 ns | 370 ns | 0 |
+| batched hand-off | 310 ns | 345 ns | 0 |
+| `-flush-min-interval 100ms` | 265 ns | 305 ns | 0 |
+
+About two thirds of the remaining reader time is the `recvmmsg` system call itself (the kernel copying the datagrams); the user-space part of the reader is about 60 ns per message. A VM with 2 vCPUs understates the gain of batched hand-off, which saves goroutine wake-ups and channel lock contention that grow with the number of readers and writers.
+
 ## Possible later additions
+
+- Count kernel drops per socket with `SO_RXQ_OVFL` and report them in the stats.
+- Steer flows to readers on the CPU that received them (`SO_INCOMING_CPU`, `SO_ATTACH_REUSEPORT_CBPF`).
 - A disk-assisted queue (rsyslog DA queue / syslog-ng disk-buffer) to absorb overloads that last a long time.
 - TCP/TLS input (RFC 6587 / RFC 5425) with real backpressure.
