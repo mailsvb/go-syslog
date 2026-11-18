@@ -30,17 +30,18 @@ type Server struct {
 func Start(ctx context.Context, cfg config.Config, log *slog.Logger) (*Server, error) {
 	st := &stats.Stats{}
 	disp := writer.NewDispatcher(writer.Options{
-		Dir:           cfg.Dir,
-		Shards:        cfg.Writers,
-		QueuePerShard: cfg.QueuePerWriter(),
-		WriteBufSize:  cfg.WriteBufSize,
-		MaxOpenFiles:  cfg.MaxOpenFiles,
-		FlushInterval: cfg.FlushInterval,
-		IdleTimeout:   cfg.IdleTimeout,
-		FsyncOnClose:  cfg.FsyncOnClose,
-		SplitByTag:    cfg.SplitByTag,
-		Stats:         st,
-		Logger:        log,
+		Dir:              cfg.Dir,
+		Shards:           cfg.Writers,
+		QueuePerShard:    cfg.QueuePerWriter(),
+		WriteBufSize:     cfg.WriteBufSize,
+		MaxOpenFiles:     cfg.MaxOpenFiles,
+		FlushInterval:    cfg.FlushInterval,
+		FlushMinInterval: cfg.FlushMinInterval,
+		IdleTimeout:      cfg.IdleTimeout,
+		FsyncOnClose:     cfg.FsyncOnClose,
+		SplitByTag:       cfg.SplitByTag,
+		Stats:            st,
+		Logger:           log,
 	})
 	recv, err := receiver.Listen(ctx, receiver.Options{
 		Listen:    cfg.Listen,

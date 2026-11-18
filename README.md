@@ -18,7 +18,7 @@ The receive and write path borrows the techniques that make rsyslog and syslog-n
 - `recvmmsg` batching
 - bounded queues that drop and count instead of blocking
 - writer shards per sender
-- buffered writes flushed on batch end and every 1 s
+- buffered writes flushed on batch end (at most every 100 ms) and every 1 s
 - an LRU open-file cache
 
 See [docs/design.md](docs/design.md) for the analysis.
@@ -60,6 +60,7 @@ All settings are command line flags (`go-syslog -h`):
 | `-batch-size` | `64` | datagrams per `recvmmsg` |
 | `-queue-size` | `65536` | in-memory queue (messages), split across writers |
 | `-flush-interval` | `1s` | longest time data stays buffered |
+| `-flush-min-interval` | `100ms` | min time between flushes when a writer's queue runs empty (0 = flush every time) |
 | `-write-buffer` | `65536` | buffer per open file |
 | `-max-open-files` | `1024` | open file cache per writer |
 | `-idle-timeout` | `2m` | close files not written for this long |

@@ -14,44 +14,46 @@ import (
 
 // Config is the complete runtime configuration.
 type Config struct {
-	Listen          string         // UDP listen address, e.g. ":514"
-	Dir             string         // base directory for <ip>/<hour>.log files
-	Retention       time.Duration  // files older than this are deleted
-	CleanupInterval time.Duration  // how often the retention janitor runs
-	Readers         int            // SO_REUSEPORT sockets / receiver goroutines
-	Writers         int            // writer shards
-	RcvBuf          int            // requested SO_RCVBUF in bytes
-	BatchSize       int            // datagrams per recvmmsg call
-	QueueSize       int            // total in-memory queue capacity (messages), split across writers
-	FlushInterval   time.Duration  // max time buffered data stays in user space
-	WriteBufSize    int            // bufio size per open file
-	MaxOpenFiles    int            // open file cache size per writer shard
-	IdleTimeout     time.Duration  // close files not written for this long
-	FsyncOnClose    bool           // fsync files when they are closed
-	SplitByTag      []netip.Prefix // senders whose files are split by syslog tag (<ip>/<tag>/)
-	StatsInterval   time.Duration  // periodic stats logging, 0 disables
-	LogLevel        string         // debug, info, warn, error
-	ShowVersion     bool
+	Listen           string         // UDP listen address, e.g. ":514"
+	Dir              string         // base directory for <ip>/<hour>.log files
+	Retention        time.Duration  // files older than this are deleted
+	CleanupInterval  time.Duration  // how often the retention janitor runs
+	Readers          int            // SO_REUSEPORT sockets / receiver goroutines
+	Writers          int            // writer shards
+	RcvBuf           int            // requested SO_RCVBUF in bytes
+	BatchSize        int            // datagrams per recvmmsg call
+	QueueSize        int            // total in-memory queue capacity (messages), split across writers
+	FlushInterval    time.Duration  // max time buffered data stays in user space
+	FlushMinInterval time.Duration  // min time between flushes when a writer queue runs empty
+	WriteBufSize     int            // bufio size per open file
+	MaxOpenFiles     int            // open file cache size per writer shard
+	IdleTimeout      time.Duration  // close files not written for this long
+	FsyncOnClose     bool           // fsync files when they are closed
+	SplitByTag       []netip.Prefix // senders whose files are split by syslog tag (<ip>/<tag>/)
+	StatsInterval    time.Duration  // periodic stats logging, 0 disables
+	LogLevel         string         // debug, info, warn, error
+	ShowVersion      bool
 }
 
 // Default returns the default configuration.
 func Default() Config {
 	return Config{
-		Listen:          ":514",
-		Dir:             "/var/log/go-syslog",
-		Retention:       7 * 24 * time.Hour,
-		CleanupInterval: 10 * time.Minute,
-		Readers:         min(runtime.NumCPU(), 4),
-		Writers:         min(runtime.NumCPU(), 16),
-		RcvBuf:          32 << 20,
-		BatchSize:       64,
-		QueueSize:       65536,
-		FlushInterval:   time.Second,
-		WriteBufSize:    64 << 10,
-		MaxOpenFiles:    1024,
-		IdleTimeout:     2 * time.Minute,
-		StatsInterval:   time.Minute,
-		LogLevel:        "info",
+		Listen:           ":514",
+		Dir:              "/var/log/go-syslog",
+		Retention:        7 * 24 * time.Hour,
+		CleanupInterval:  10 * time.Minute,
+		Readers:          min(runtime.NumCPU(), 4),
+		Writers:          min(runtime.NumCPU(), 16),
+		RcvBuf:           32 << 20,
+		BatchSize:        64,
+		QueueSize:        65536,
+		FlushInterval:    time.Second,
+		FlushMinInterval: 100 * time.Millisecond,
+		WriteBufSize:     64 << 10,
+		MaxOpenFiles:     1024,
+		IdleTimeout:      2 * time.Minute,
+		StatsInterval:    time.Minute,
+		LogLevel:         "info",
 	}
 }
 
@@ -70,6 +72,7 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.IntVar(&c.BatchSize, "batch-size", c.BatchSize, "datagrams read per recvmmsg call")
 	fs.IntVar(&c.QueueSize, "queue-size", c.QueueSize, "total in-memory queue capacity in messages")
 	fs.DurationVar(&c.FlushInterval, "flush-interval", c.FlushInterval, "max time data stays buffered before it is written")
+	fs.DurationVar(&c.FlushMinInterval, "flush-min-interval", c.FlushMinInterval, "min time between flushes when a writer's queue runs empty (0: flush every time; saves write syscalls at moderate load)")
 	fs.IntVar(&c.WriteBufSize, "write-buffer", c.WriteBufSize, "write buffer size per open file in bytes")
 	fs.IntVar(&c.MaxOpenFiles, "max-open-files", c.MaxOpenFiles, "open file cache size per writer shard")
 	fs.DurationVar(&c.IdleTimeout, "idle-timeout", c.IdleTimeout, "close files that were not written for this long")
@@ -121,6 +124,9 @@ func (c Config) Validate() error {
 	positiveDur("cleanup-interval", c.CleanupInterval)
 	positiveDur("flush-interval", c.FlushInterval)
 	positiveDur("idle-timeout", c.IdleTimeout)
+	if c.FlushMinInterval < 0 {
+		errs = append(errs, errors.New("flush-min-interval must be >= 0"))
+	}
 	if c.StatsInterval < 0 {
 		errs = append(errs, errors.New("stats-interval must be >= 0"))
 	}

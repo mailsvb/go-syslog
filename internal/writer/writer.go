@@ -3,9 +3,10 @@
 // Messages are sharded by sender address. Each shard is a single goroutine that
 // owns its open files, so per-sender ordering is preserved and no locks are
 // needed on the write path. Writes go into a bufio.Writer per file and are
-// flushed when the shard's queue runs empty, on a timer, on rotation/eviction
-// and on shutdown, similar to rsyslog's omfile (asyncWriting, flushOnTXEnd,
-// dynaFileCache) and syslog-ng's flush_lines/flush_timeout/time_reap.
+// flushed when the shard's queue runs empty (at most every FlushMinInterval),
+// on a timer, on rotation/eviction and on shutdown, similar to rsyslog's
+// omfile (asyncWriting, flushOnTXEnd, dynaFileCache) and syslog-ng's
+// flush_lines/flush_timeout/time_reap.
 package writer
 
 import (
@@ -45,14 +46,19 @@ type Options struct {
 	WriteBufSize  int
 	MaxOpenFiles  int // per shard
 	FlushInterval time.Duration
-	IdleTimeout   time.Duration
-	FsyncOnClose  bool
-	SplitByTag    []netip.Prefix // senders whose files are split by syslog tag
-	DirMode       os.FileMode
-	FileMode      os.FileMode
-	Now           func() time.Time // for tests; defaults to time.Now
-	Stats         *stats.Stats
-	Logger        *slog.Logger
+	// FlushMinInterval rate-limits the flush when a shard's queue runs empty,
+	// so moderate traffic does not cost one write(2) per message. Buffered
+	// data reaches the page cache at most this long after the last flush.
+	// 0 flushes every time the queue runs empty.
+	FlushMinInterval time.Duration
+	IdleTimeout      time.Duration
+	FsyncOnClose     bool
+	SplitByTag       []netip.Prefix // senders whose files are split by syslog tag
+	DirMode          os.FileMode
+	FileMode         os.FileMode
+	Now              func() time.Time // for tests; defaults to time.Now
+	Stats            *stats.Stats
+	Logger           *slog.Logger
 }
 
 func (o *Options) setDefaults() {
@@ -300,6 +306,10 @@ type shard struct {
 	queued atomic.Int64
 	limit  int64
 
+	lastFlush time.Time
+	flushT    *time.Timer // pending deferred flush, see endOfBatch
+	flushC    <-chan time.Time
+
 	scratch    []byte
 	lastTime   time.Time
 	lastStamp  []byte
@@ -345,8 +355,10 @@ func (s *shard) run() {
 					break drain
 				}
 			}
-			s.publishStats()
-			s.flushDirty() // queue drained: end of transaction
+			s.endOfBatch()
+		case <-s.flushC:
+			s.flushC = nil
+			s.flushDirty()
 		case <-t.C:
 			s.publishStats()
 			s.flushDirty()
@@ -356,6 +368,31 @@ func (s *shard) run() {
 			close(reply)
 		}
 	}
+}
+
+// endOfBatch runs when the queue has been drained (rsyslog flushOnTXEnd).
+// It flushes the dirty files unless the last flush was less than
+// FlushMinInterval ago; then a timer flushes them when the interval is up.
+func (s *shard) endOfBatch() {
+	s.publishStats()
+	if s.o.FlushMinInterval <= 0 {
+		s.flushDirty()
+		return
+	}
+	if s.flushC != nil {
+		return // a deferred flush is already pending
+	}
+	wait := s.o.FlushMinInterval - s.o.Now().Sub(s.lastFlush)
+	if wait <= 0 {
+		s.flushDirty()
+		return
+	}
+	if s.flushT == nil {
+		s.flushT = time.NewTimer(wait)
+	} else {
+		s.flushT.Reset(wait)
+	}
+	s.flushC = s.flushT.C
 }
 
 // handleBatch writes the messages of b, recycles it and returns how many
@@ -485,6 +522,9 @@ func (s *shard) open(key fileKey, t time.Time) (*openFile, error) {
 }
 
 func (s *shard) flushDirty() {
+	if s.o.FlushMinInterval > 0 {
+		s.lastFlush = s.o.Now()
+	}
 	for i, of := range s.dirty {
 		s.dirty[i] = nil
 		if !of.dirty {

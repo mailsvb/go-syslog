@@ -391,3 +391,65 @@ func TestBatcherOrder(t *testing.T) {
 		}
 	}
 }
+
+// With FlushMinInterval, an empty queue only flushes if the last flush is
+// long enough ago; otherwise a timer flushes later.
+func TestDispatcherFlushMinInterval(t *testing.T) {
+	waitWritten := func(o Options, n uint64) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for o.Stats.Written.Load() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("written = %d, want %d", o.Stats.Written.Load(), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitOnDisk := func(path, s string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if b, _ := os.ReadFile(path); bytes.Contains(b, []byte(s)) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%q not flushed", s)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	ts := time.Now()
+
+	t.Run("deferred", func(t *testing.T) {
+		o := testOptions(t)
+		o.FlushInterval = time.Hour
+		o.FlushMinInterval = time.Hour
+		d := NewDispatcher(o)
+		path := FilePath(o.Dir, ip1, "", ts)
+		d.Dispatch(msg(ip1, ts, "first"))
+		waitOnDisk(path, "first") // no flush yet: flushed at once
+		d.Dispatch(msg(ip1, ts, "second"))
+		waitWritten(o, 2) // published right before the (skipped) flush
+		time.Sleep(20 * time.Millisecond)
+		if b, _ := os.ReadFile(path); bytes.Contains(b, []byte("second")) {
+			t.Fatal("flushed again within FlushMinInterval")
+		}
+		d.Close()
+		waitOnDisk(path, "second")
+	})
+
+	t.Run("timer", func(t *testing.T) {
+		o := testOptions(t)
+		o.FlushInterval = time.Hour
+		o.FlushMinInterval = 30 * time.Millisecond
+		d := NewDispatcher(o)
+		defer d.Close()
+		path := FilePath(o.Dir, ip1, "", ts)
+		d.Dispatch(msg(ip1, ts, "m0"))
+		waitOnDisk(path, "m0") // flushed at once, starts the interval
+		for i := 1; i < 5; i++ {
+			d.Dispatch(msg(ip1, ts, fmt.Sprintf("m%d", i)))
+		}
+		waitOnDisk(path, "m4") // by the deferred flush, the ticker is 1h
+	})
+}

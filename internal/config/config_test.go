@@ -11,17 +11,19 @@ func TestParseDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":514" || c.Dir != "/var/log/go-syslog" || c.Retention != 7*24*time.Hour {
+	if c.Listen != ":514" || c.Dir != "/var/log/go-syslog" || c.Retention != 7*24*time.Hour ||
+		c.FlushMinInterval != 100*time.Millisecond {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 }
 
 func TestParseFlags(t *testing.T) {
-	c, err := Parse([]string{"-listen", "127.0.0.1:5514", "-dir", "/tmp/x", "-retention", "48h", "-writers", "2", "-queue-size", "10"}, io.Discard)
+	c, err := Parse([]string{"-listen", "127.0.0.1:5514", "-dir", "/tmp/x", "-retention", "48h", "-writers", "2", "-queue-size", "10", "-flush-min-interval", "0"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != "127.0.0.1:5514" || c.Dir != "/tmp/x" || c.Retention != 48*time.Hour || c.Writers != 2 {
+	if c.Listen != "127.0.0.1:5514" || c.Dir != "/tmp/x" || c.Retention != 48*time.Hour || c.Writers != 2 ||
+		c.FlushMinInterval != 0 {
 		t.Fatalf("flags not applied: %+v", c)
 	}
 	if c.QueuePerWriter() != 1024 {
@@ -52,6 +54,7 @@ func TestParseInvalid(t *testing.T) {
 	for _, args := range [][]string{
 		{"-readers", "0"},
 		{"-retention", "0s"},
+		{"-flush-min-interval", "-1s"},
 		{"-log-level", "loud"},
 		{"-dir", ""},
 		{"extra"},
