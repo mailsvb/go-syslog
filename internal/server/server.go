@@ -47,7 +47,7 @@ func Start(ctx context.Context, cfg config.Config, log *slog.Logger) (*Server, e
 		Readers:   cfg.Readers,
 		RcvBuf:    cfg.RcvBuf,
 		BatchSize: cfg.BatchSize,
-		Dispatch:  disp.Dispatch,
+		NewSink:   func() receiver.Sink { return disp.NewBatcher() },
 		Stats:     st,
 		Logger:    log,
 	})

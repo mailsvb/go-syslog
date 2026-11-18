@@ -152,7 +152,7 @@ func TestDispatchSplitNoAllocs(t *testing.T) {
 	m := msg(ip1, ts, "<30>1 2026-11-18T10:00:00Z dockerhost web-1 1 web-1 - hello")
 	step := func() {
 		d.Dispatch(m)
-		s.handle(<-s.ch)
+		s.handleBatch(<-s.ch)
 	}
 	step() // opens the file and interns the tag
 	if n := testing.AllocsPerRun(200, step); n != 0 {
@@ -193,13 +193,19 @@ func BenchmarkDispatch(b *testing.B) {
 				d.shards[i] = newShard(d.shards[i].o, i)
 			}
 			m := Message{Addr: ip1, Data: payload}
+			bt := d.NewBatcher()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				d.Dispatch(m)
+				bt.Add(m)
+				if i%64 == 63 { // like a full recvmmsg batch
+					bt.Flush()
+				}
 				if i%1024 == 1023 {
 					for _, s := range d.shards {
 						for len(s.ch) > 0 {
-							<-s.ch
+							bb := <-s.ch
+							s.queued.Add(-int64(len(bb.msgs)))
+							putBatch(bb)
 						}
 					}
 				}

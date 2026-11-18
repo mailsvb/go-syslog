@@ -3,7 +3,7 @@
 // Like rsyslog imudp and syslog-ng, it opens several SO_REUSEPORT sockets with
 // a large SO_RCVBUF and reads them with recvmmsg (mmsg_linux.go). Each
 // reader does as little work as possible: one clock read per batch, copy the
-// payload into a pooled buffer, hand it to the writer without blocking.
+// payload into a pooled buffer, hand the batch to the writers without blocking.
 package receiver
 
 import (
@@ -28,9 +28,17 @@ type Options struct {
 	Readers   int
 	RcvBuf    int
 	BatchSize int
-	Dispatch  func(writer.Message) bool
-	Stats     *stats.Stats
-	Logger    *slog.Logger
+	// NewSink is called once per reader goroutine. The reader Adds every
+	// datagram of a receive call and then calls Flush.
+	NewSink func() Sink
+	Stats   *stats.Stats
+	Logger  *slog.Logger
+}
+
+// Sink takes the messages of one reader. writer.Batcher implements it.
+type Sink interface {
+	Add(writer.Message)
+	Flush()
 }
 
 // Receiver owns the listening sockets.
@@ -117,6 +125,7 @@ func (r *Receiver) readLoop(c net.PacketConn) {
 		return
 	}
 	b := pr.batch()
+	sink := r.o.NewSink()
 	var lastErrLog time.Time
 	for {
 		n, err := pr.read()
@@ -140,7 +149,8 @@ func (r *Receiver) readLoop(c net.PacketConn) {
 			}
 			buf := bufpool.Get(b.lens[i])
 			copy(buf, b.bufs[i])
-			r.o.Dispatch(writer.Message{Addr: addr, Time: now, Data: buf})
+			sink.Add(writer.Message{Addr: addr, Time: now, Data: buf})
 		}
+		sink.Flush()
 	}
 }

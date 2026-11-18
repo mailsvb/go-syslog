@@ -13,6 +13,11 @@ import (
 	"github.com/mailsvb/go-syslog/internal/writer"
 )
 
+type chanSink chan writer.Message
+
+func (c chanSink) Add(m writer.Message) { c <- m }
+func (c chanSink) Flush()               {}
+
 // TestReceive checks addresses and payloads for IPv4, IPv6 and IPv4 on a
 // dual-stack socket (v4-mapped, must be reported as plain IPv4).
 func TestReceive(t *testing.T) {
@@ -28,7 +33,7 @@ func TestReceive(t *testing.T) {
 				Readers:   1,
 				RcvBuf:    1 << 20,
 				BatchSize: 8, // smaller than the burst: several full batches
-				Dispatch:  func(m writer.Message) bool { got <- m; return true },
+				NewSink:   func() Sink { return chanSink(got) },
 				Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 			if err != nil {

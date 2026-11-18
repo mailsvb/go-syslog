@@ -338,3 +338,56 @@ func TestShardLastFileCache(t *testing.T) {
 		t.Errorf("written = %d, want 10", st.Written)
 	}
 }
+
+// The queue limit is in messages: a batch that does not fit is dropped as a
+// whole and every message in it is counted.
+func TestBatcherDropsWholeBatch(t *testing.T) {
+	o := testOptions(t)
+	o.QueuePerShard = 100
+	d := &Dispatcher{shards: []*shard{newShard(o, 0)}, stats: o.Stats} // shard not running
+	bt := d.NewBatcher()
+	ts := time.Now()
+	for i := 0; i < 150; i++ {
+		bt.Add(msg(ip1, ts, "x")) // sends at 64 (queued 64) and 128 (would be 128: dropped)
+	}
+	bt.Flush() // 22 more: 86 queued
+	if got := o.Stats.DroppedQueueFull.Load(); got != batchCap {
+		t.Fatalf("dropped = %d, want %d", got, batchCap)
+	}
+	if got := d.shards[0].queued.Load(); got != 150-batchCap {
+		t.Fatalf("queued = %d, want %d", got, 150-batchCap)
+	}
+}
+
+// Several Batchers (readers) feed the same shards; each keeps its order.
+func TestBatcherOrder(t *testing.T) {
+	o := testOptions(t)
+	o.Shards = 3
+	o.QueuePerShard = 1 << 20
+	d := NewDispatcher(o)
+	ts := time.Date(2026, 11, 18, 10, 30, 0, 0, time.UTC)
+	addrs := []netip.Addr{ip1, ip2, ip3}
+	const n = 1000
+	for r, a := range addrs {
+		bt := d.NewBatcher()
+		for i := 0; i < n; i++ {
+			bt.Add(msg(a, ts, fmt.Sprintf("seq=%d", i)))
+			if i%(37+r) == 0 { // flush at odd points, across batchCap boundaries
+				bt.Flush()
+			}
+		}
+		bt.Flush()
+	}
+	d.Close()
+	for _, a := range addrs {
+		lines := strings.Split(strings.TrimSuffix(readFile(t, FilePath(o.Dir, a, "", ts)), "\n"), "\n")
+		if len(lines) != n {
+			t.Fatalf("%s: %d lines, want %d", a, len(lines), n)
+		}
+		for i, l := range lines {
+			if !strings.HasSuffix(l, fmt.Sprintf(" seq=%d", i)) {
+				t.Fatalf("%s: line %d out of order: %q", a, i, l)
+			}
+		}
+	}
+}

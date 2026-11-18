@@ -17,6 +17,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mailsvb/go-syslog/internal/bufpool"
@@ -150,30 +152,105 @@ func (d *Dispatcher) splits(a netip.Addr) bool {
 	return false
 }
 
-// Dispatch queues m for writing. It never blocks: if the shard queue is full
-// the message is dropped and counted (rsyslog "discard mark" behaviour).
-// For split senders it finds the tag and picks the shard by (ip, tag), so the
-// sources behind one IP are spread over the writers.
-// Dispatch must not be called after Close.
-func (d *Dispatcher) Dispatch(m Message) bool {
-	var idx int
+// route picks the shard for m. For split senders it finds the tag, records
+// it in m and picks the shard by (ip, tag), so the sources behind one IP are
+// spread over the writers.
+func (d *Dispatcher) route(m *Message) int {
 	if len(d.split) > 0 && d.splits(m.Addr) {
 		start, end := parseTag(m.Data)
 		m.Split, m.TagStart, m.TagEnd = true, int32(start), int32(end)
 		if n := len(d.shards); n > 1 {
-			idx = int(hashTag(hashAddr(m.Addr), m.Data[start:end]) % uint32(n))
+			return int(hashTag(hashAddr(m.Addr), m.Data[start:end]) % uint32(n))
 		}
-	} else {
-		idx = shardIndex(m.Addr, len(d.shards))
+		return 0
 	}
-	s := d.shards[idx]
-	select {
-	case s.ch <- m:
-		return true
-	default:
-		d.stats.DroppedQueueFull.Add(1)
+	return shardIndex(m.Addr, len(d.shards))
+}
+
+// batchCap is the number of messages in one hand-off to a shard.
+const batchCap = 64
+
+// batch is a group of messages for one shard, handed over with a single
+// channel operation instead of one per message.
+type batch struct{ msgs []Message }
+
+var batchPool = sync.Pool{New: func() any { return &batch{msgs: make([]Message, 0, batchCap)} }}
+
+func getBatch() *batch { return batchPool.Get().(*batch) }
+
+func putBatch(b *batch) {
+	b.msgs = b.msgs[:0]
+	batchPool.Put(b)
+}
+
+// send queues b on shard i. It never blocks: if the shard already holds
+// QueuePerShard messages the whole batch is dropped and counted (rsyslog
+// "discard mark" behaviour).
+func (d *Dispatcher) send(i int, b *batch) bool {
+	s := d.shards[i]
+	n := int64(len(b.msgs))
+	if s.queued.Add(n) <= s.limit {
+		select {
+		case s.ch <- b:
+			return true
+		default:
+		}
+	}
+	s.queued.Add(-n)
+	d.stats.DroppedQueueFull.Add(uint64(n))
+	for _, m := range b.msgs {
 		bufpool.Put(m.Data)
-		return false
+	}
+	putBatch(b)
+	return false
+}
+
+// Dispatch queues a single message for writing; see Batcher for the
+// batched form used by the receivers. It must not be called after Close.
+func (d *Dispatcher) Dispatch(m Message) bool {
+	i := d.route(&m)
+	b := getBatch()
+	b.msgs = append(b.msgs, m)
+	return d.send(i, b)
+}
+
+// Batcher collects messages per shard and hands each shard its messages
+// with one channel operation per Flush (or per batchCap messages). Each
+// receiver goroutine owns one; it is not safe for concurrent use. Messages
+// of one Batcher keep their order per shard.
+type Batcher struct {
+	d       *Dispatcher
+	pending []*batch // per shard, nil if empty
+}
+
+// NewBatcher returns a Batcher that feeds d.
+func (d *Dispatcher) NewBatcher() *Batcher {
+	return &Batcher{d: d, pending: make([]*batch, len(d.shards))}
+}
+
+// Add queues m. It is handed to its shard at the next Flush at the latest.
+func (b *Batcher) Add(m Message) {
+	i := b.d.route(&m)
+	p := b.pending[i]
+	if p == nil {
+		p = getBatch()
+		b.pending[i] = p
+	}
+	p.msgs = append(p.msgs, m)
+	if len(p.msgs) == batchCap {
+		b.pending[i] = nil
+		b.d.send(i, p)
+	}
+}
+
+// Flush hands all pending messages to their shards. Messages that do not
+// fit into a full shard queue are dropped and counted.
+func (b *Batcher) Flush() {
+	for i, p := range b.pending {
+		if p != nil {
+			b.pending[i] = nil
+			b.d.send(i, p)
+		}
 	}
 }
 
@@ -191,7 +268,8 @@ func (d *Dispatcher) Reopen() {
 }
 
 // Close drains all queues, flushes and closes every file and waits for the
-// shards to stop. No Dispatch calls may happen concurrently or afterwards.
+// shards to stop. No Dispatch or Batcher calls may happen concurrently or
+// afterwards.
 func (d *Dispatcher) Close() {
 	for _, s := range d.shards {
 		close(s.ch)
@@ -204,7 +282,7 @@ func (d *Dispatcher) Close() {
 type shard struct {
 	o     Options
 	id    int
-	ch    chan Message
+	ch    chan *batch
 	ctl   chan chan struct{}
 	done  chan struct{}
 	files map[fileKey]*openFile
@@ -217,6 +295,11 @@ type shard struct {
 	// batch instead of once per message (shared atomics are contended).
 	written, bytes uint64
 
+	// Messages in ch. Senders reserve room before sending, so the queue is
+	// bounded in messages (limit), not in batches.
+	queued atomic.Int64
+	limit  int64
+
 	scratch    []byte
 	lastTime   time.Time
 	lastStamp  []byte
@@ -227,7 +310,8 @@ func newShard(o Options, id int) *shard {
 	return &shard{
 		o:     o,
 		id:    id,
-		ch:    make(chan Message, o.QueuePerShard),
+		ch:    make(chan *batch, o.QueuePerShard), // every batch holds >= 1 message
+		limit: int64(o.QueuePerShard),
 		ctl:   make(chan chan struct{}),
 		done:  make(chan struct{}),
 		files: make(map[fileKey]*openFile),
@@ -242,21 +326,21 @@ func (s *shard) run() {
 	defer t.Stop()
 	for {
 		select {
-		case m, ok := <-s.ch:
+		case b, ok := <-s.ch:
 			if !ok {
 				s.closeAll()
 				return
 			}
-			s.handle(m)
+			n := s.handleBatch(b)
 		drain:
-			for i := 1; i < maxBatch; i++ {
+			for n < maxBatch {
 				select {
-				case m, ok = <-s.ch:
+				case b, ok = <-s.ch:
 					if !ok {
 						s.closeAll()
 						return
 					}
-					s.handle(m)
+					n += s.handleBatch(b)
 				default:
 					break drain
 				}
@@ -272,6 +356,18 @@ func (s *shard) run() {
 			close(reply)
 		}
 	}
+}
+
+// handleBatch writes the messages of b, recycles it and returns how many
+// messages it held.
+func (s *shard) handleBatch(b *batch) int {
+	n := len(b.msgs)
+	s.queued.Add(-int64(n))
+	for _, m := range b.msgs {
+		s.handle(m)
+	}
+	putBatch(b)
+	return n
 }
 
 // handle writes one message into the buffer of its (sender, hour) file.
