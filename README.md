@@ -120,4 +120,4 @@ printf '<13>hello\n' | nc -u -w1 127.0.0.1 5514    # macOS / anywhere
 One-time setup:
 
 1. *Settings → Pages*: source **GitHub Actions**. The release workflow deploys the repository with `actions/deploy-pages`; the `gh-pages` branch only stores the published RPMs for the next release.
-2. Optional, for signed packages: add the repository secret `GPG_PRIVATE_KEY` (ASCII-armored private key), plus `GPG_PASSPHRASE` only if the key is password protected. Without them the RPMs and repository metadata are unsigned, and the generated `go-syslog.repo` sets `gpgcheck=0`.
+2. Optional, for signed packages: add the repository secret `GPG_PRIVATE_KEY` (output of `gpg --armor --export-secret-keys <KEYID>`, or the same base64 encoded), plus `GPG_PASSPHRASE` only if the key is password protected. Without them the RPMs and repository metadata are unsigned, and the generated `go-syslog.repo` sets `gpgcheck=0`.

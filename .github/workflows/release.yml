@@ -66,10 +66,10 @@ jobs:
             echo "::warning::GPG_PRIVATE_KEY secret not set: RPM and repository will be unsigned"
             exit 0
           fi
-          key_file="$RUNNER_TEMP/rpm-signing-key.asc"
-          printf '%s\n' "$GPG_PRIVATE_KEY" > "$key_file"
-          gpg --batch --import "$key_file"
-          key_id=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/ {print $5; exit}')
+          # Accepts the key ASCII-armored or base64 encoded; fails with a hint otherwise.
+          key_file="$RUNNER_TEMP/rpm-signing-key"
+          key_id=$(scripts/import-gpg-key.sh "$key_file")
+          echo "Signing with key $key_id"
           echo "SIGN_KEY_ID=$key_id" >> "$GITHUB_ENV"
           echo "NFPM_RPM_KEY_FILE=$key_file" >> "$GITHUB_ENV"
 
