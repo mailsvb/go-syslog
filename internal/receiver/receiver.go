@@ -1,7 +1,7 @@
 // Package receiver reads syslog datagrams from UDP sockets.
 //
 // Like rsyslog imudp and syslog-ng, it opens several SO_REUSEPORT sockets with
-// a large SO_RCVBUF and reads them with recvmmsg (via x/net ReadBatch). Each
+// a large SO_RCVBUF and reads them with recvmmsg (mmsg_linux.go). Each
 // reader does as little work as possible: one clock read per batch, copy the
 // payload into a pooled buffer, hand it to the writer without blocking.
 package receiver
@@ -12,22 +12,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
 	"runtime"
 	"strconv"
 	"sync"
 	"time"
 
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-
 	"github.com/mailsvb/go-syslog/internal/bufpool"
 	"github.com/mailsvb/go-syslog/internal/stats"
 	"github.com/mailsvb/go-syslog/internal/writer"
 )
-
-// maxDatagram is the largest possible UDP payload.
-const maxDatagram = 65535
 
 // Options configures the receiver.
 type Options struct {
@@ -45,17 +38,6 @@ type Receiver struct {
 	o     Options
 	conns []net.PacketConn
 	wg    sync.WaitGroup
-}
-
-// batchReader is implemented by ipv4.PacketConn and ipv6.PacketConn.
-type batchReader interface {
-	ReadBatch(ms []ipv4.Message, flags int) (int, error)
-}
-
-type v6reader struct{ c *ipv6.PacketConn }
-
-func (r v6reader) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
-	return r.c.ReadBatch(ms, flags)
 }
 
 // Listen opens Options.Readers sockets on the same address. It does not start
@@ -122,13 +104,6 @@ func (r *Receiver) Close() {
 	r.wg.Wait()
 }
 
-func newBatchReader(c net.PacketConn) batchReader {
-	if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP.To4() != nil {
-		return ipv4.NewPacketConn(c)
-	}
-	return v6reader{ipv6.NewPacketConn(c)}
-}
-
 func (r *Receiver) readLoop(c net.PacketConn) {
 	defer r.wg.Done()
 	// A dedicated OS thread for each reader keeps the socket drained even when
@@ -136,14 +111,15 @@ func (r *Receiver) readLoop(c net.PacketConn) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	br := newBatchReader(c)
-	ms := make([]ipv4.Message, r.o.BatchSize)
-	for i := range ms {
-		ms[i].Buffers = [][]byte{make([]byte, maxDatagram)}
+	pr, err := newPacketReader(c, r.o.BatchSize)
+	if err != nil {
+		r.o.Logger.Error("cannot read socket", "err", err)
+		return
 	}
+	b := pr.batch()
 	var lastErrLog time.Time
 	for {
-		n, err := br.ReadBatch(ms, 0)
+		n, err := pr.read()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -158,25 +134,13 @@ func (r *Receiver) readLoop(c net.PacketConn) {
 		now := time.Now() // one clock read per batch (rsyslog timeRequery)
 		r.o.Stats.Received.Add(uint64(n))
 		for i := 0; i < n; i++ {
-			addr, ok := addrOf(ms[i].Addr)
-			if !ok {
+			addr := b.addrs[i]
+			if !addr.IsValid() {
 				continue
 			}
-			buf := bufpool.Get(ms[i].N)
-			copy(buf, ms[i].Buffers[0][:ms[i].N])
+			buf := bufpool.Get(b.lens[i])
+			copy(buf, b.bufs[i])
 			r.o.Dispatch(writer.Message{Addr: addr, Time: now, Data: buf})
 		}
 	}
-}
-
-func addrOf(a net.Addr) (netip.Addr, bool) {
-	ua, ok := a.(*net.UDPAddr)
-	if !ok || ua == nil {
-		return netip.Addr{}, false
-	}
-	ip, ok := netip.AddrFromSlice(ua.IP)
-	if !ok {
-		return netip.Addr{}, false
-	}
-	return writer.NormalizeAddr(ip), true
 }
