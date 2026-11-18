@@ -28,6 +28,11 @@ type Message struct {
 	Addr netip.Addr // normalized sender address
 	Time time.Time  // receive time
 	Data []byte     // payload, owned by the writer after Dispatch (from bufpool)
+
+	// Set by Dispatch for senders in Options.SplitByTag: the message goes to
+	// <ip>/<tag>/ and Data[TagStart:TagEnd] is the raw tag (empty: untagged).
+	Split            bool
+	TagStart, TagEnd int32
 }
 
 // Options configures the writer shards.
@@ -40,6 +45,7 @@ type Options struct {
 	FlushInterval time.Duration
 	IdleTimeout   time.Duration
 	FsyncOnClose  bool
+	SplitByTag    []netip.Prefix // senders whose files are split by syslog tag
 	DirMode       os.FileMode
 	FileMode      os.FileMode
 	Now           func() time.Time // for tests; defaults to time.Now
@@ -90,16 +96,20 @@ const maxBatch = 4096
 // errLogEvery limits how often a shard logs write errors (e.g. disk full).
 const errLogEvery = 10 * time.Second
 
-// Dispatcher routes messages to writer shards by sender address.
+// maxInterned bounds the per-shard cache of tag strings.
+const maxInterned = 4096
+
+// Dispatcher routes messages to writer shards by sender address (and tag).
 type Dispatcher struct {
 	shards []*shard
+	split  []netip.Prefix
 	stats  *stats.Stats
 }
 
 // NewDispatcher creates and starts the writer shards.
 func NewDispatcher(o Options) *Dispatcher {
 	o.setDefaults()
-	d := &Dispatcher{stats: o.Stats}
+	d := &Dispatcher{split: o.SplitByTag, stats: o.Stats}
 	for i := 0; i < o.Shards; i++ {
 		s := newShard(o, i)
 		d.shards = append(d.shards, s)
@@ -108,25 +118,55 @@ func NewDispatcher(o Options) *Dispatcher {
 	return d
 }
 
-// shardIndex hashes the address with FNV-1a.
+const (
+	fnvOffset = 2166136261
+	fnvPrime  = 16777619
+)
+
+// hashAddr hashes the address with FNV-1a.
+func hashAddr(a netip.Addr) uint32 {
+	h := uint32(fnvOffset)
+	for _, c := range a.As16() {
+		h = (h ^ uint32(c)) * fnvPrime
+	}
+	return h
+}
+
+// shardIndex picks the shard for a sender that is not split by tag.
 func shardIndex(a netip.Addr, n int) int {
 	if n == 1 {
 		return 0
 	}
-	b := a.As16()
-	h := uint32(2166136261)
-	for _, c := range b {
-		h ^= uint32(c)
-		h *= 16777619
+	return int(hashAddr(a) % uint32(n))
+}
+
+// splits reports whether files of sender a are split by tag.
+func (d *Dispatcher) splits(a netip.Addr) bool {
+	for _, p := range d.split {
+		if p.Contains(a) {
+			return true
+		}
 	}
-	return int(h % uint32(n))
+	return false
 }
 
 // Dispatch queues m for writing. It never blocks: if the shard queue is full
 // the message is dropped and counted (rsyslog "discard mark" behaviour).
+// For split senders it finds the tag and picks the shard by (ip, tag), so the
+// sources behind one IP are spread over the writers.
 // Dispatch must not be called after Close.
 func (d *Dispatcher) Dispatch(m Message) bool {
-	s := d.shards[shardIndex(m.Addr, len(d.shards))]
+	var idx int
+	if len(d.split) > 0 && d.splits(m.Addr) {
+		start, end := parseTag(m.Data)
+		m.Split, m.TagStart, m.TagEnd = true, int32(start), int32(end)
+		if n := len(d.shards); n > 1 {
+			idx = int(hashTag(hashAddr(m.Addr), m.Data[start:end]) % uint32(n))
+		}
+	} else {
+		idx = shardIndex(m.Addr, len(d.shards))
+	}
+	s := d.shards[idx]
 	select {
 	case s.ch <- m:
 		return true
@@ -168,7 +208,8 @@ type shard struct {
 	ctl   chan chan struct{}
 	done  chan struct{}
 	files map[fileKey]*openFile
-	lru   *list.List // front = most recently written
+	tags  map[string]string // raw tag -> sanitized tag (interned)
+	lru   *list.List        // front = most recently written
 	dirty []*openFile
 
 	scratch    []byte
@@ -185,6 +226,7 @@ func newShard(o Options, id int) *shard {
 		ctl:   make(chan chan struct{}),
 		done:  make(chan struct{}),
 		files: make(map[fileKey]*openFile),
+		tags:  make(map[string]string),
 		lru:   list.New(),
 	}
 }
@@ -228,14 +270,14 @@ func (s *shard) run() {
 // handle writes one message into the buffer of its (sender, hour) file.
 func (s *shard) handle(m Message) {
 	defer bufpool.Put(m.Data)
-	key := fileKey{addr: m.Addr, hour: hourOf(m.Time)}
+	key := fileKey{addr: m.Addr, tag: s.tagOf(m), hour: hourOf(m.Time)}
 	of := s.files[key]
 	if of == nil {
 		var err error
 		of, err = s.open(key, m.Time)
 		if err != nil {
 			s.o.Stats.WriteErrors.Add(1)
-			s.logErr("open failed", FilePath(s.o.Dir, key.addr, m.Time), err)
+			s.logErr("open failed", FilePath(s.o.Dir, key.addr, key.tag, m.Time), err)
 			return
 		}
 	} else {
@@ -256,6 +298,24 @@ func (s *shard) handle(m Message) {
 	}
 	s.o.Stats.Written.Add(1)
 	s.o.Stats.BytesWritten.Add(uint64(n))
+}
+
+// tagOf returns the directory name for the tag of m ("" if m is not split).
+// Known tags are looked up without allocating; a new tag is sanitized once.
+func (s *shard) tagOf(m Message) string {
+	if !m.Split {
+		return ""
+	}
+	raw := m.Data[m.TagStart:m.TagEnd]
+	if tag, ok := s.tags[string(raw)]; ok {
+		return tag
+	}
+	if len(s.tags) >= maxInterned {
+		clear(s.tags) // only a cache; bounds memory when names churn
+	}
+	tag := sanitizeTag(raw)
+	s.tags[string(raw)] = tag
+	return tag
 }
 
 func (s *shard) writeLine(w *bufio.Writer, m Message) (int, error) {
@@ -288,7 +348,7 @@ func (s *shard) open(key fileKey, t time.Time) (*openFile, error) {
 	for s.lru.Len() >= s.o.MaxOpenFiles {
 		s.close(s.lru.Back().Value.(*openFile))
 	}
-	path := FilePath(s.o.Dir, key.addr, t)
+	path := FilePath(s.o.Dir, key.addr, key.tag, t)
 	const flags = os.O_WRONLY | os.O_APPEND | os.O_CREATE
 	f, err := os.OpenFile(path, flags, s.o.FileMode)
 	if errors.Is(err, fs.ErrNotExist) {

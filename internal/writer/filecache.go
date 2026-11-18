@@ -16,10 +16,11 @@ const (
 	FileExt = ".log"
 )
 
-// fileKey identifies one hourly file of one sender.
+// fileKey identifies one hourly file of one sender (and tag).
 type fileKey struct {
 	addr netip.Addr
-	hour int64 // hours since the Unix epoch, UTC
+	tag  string // sanitized tag for split senders, "" otherwise
+	hour int64  // hours since the Unix epoch, UTC
 }
 
 type openFile struct {
@@ -48,7 +49,13 @@ func NormalizeAddr(a netip.Addr) netip.Addr {
 	return a.Unmap().WithZone("")
 }
 
-// FilePath returns <dir>/<ip>/<YYYY-MM-DD_HH>.log for the given hour.
-func FilePath(dir string, addr netip.Addr, t time.Time) string {
-	return filepath.Join(dir, addr.String(), t.UTC().Format(HourLayout)+FileExt)
+// FilePath returns <dir>/<ip>/<YYYY-MM-DD_HH>.log for the given hour, or
+// <dir>/<ip>/<tag>/<YYYY-MM-DD_HH>.log if tag is not empty. tag must already
+// be sanitized.
+func FilePath(dir string, addr netip.Addr, tag string, t time.Time) string {
+	name := t.UTC().Format(HourLayout) + FileExt
+	if tag == "" {
+		return filepath.Join(dir, addr.String(), name)
+	}
+	return filepath.Join(dir, addr.String(), tag, name)
 }

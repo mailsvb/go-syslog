@@ -6,28 +6,31 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"runtime"
+	"strings"
 	"time"
 )
 
 // Config is the complete runtime configuration.
 type Config struct {
-	Listen          string        // UDP listen address, e.g. ":514"
-	Dir             string        // base directory for <ip>/<hour>.log files
-	Retention       time.Duration // files older than this are deleted
-	CleanupInterval time.Duration // how often the retention janitor runs
-	Readers         int           // SO_REUSEPORT sockets / receiver goroutines
-	Writers         int           // writer shards
-	RcvBuf          int           // requested SO_RCVBUF in bytes
-	BatchSize       int           // datagrams per recvmmsg call
-	QueueSize       int           // total in-memory queue capacity (messages), split across writers
-	FlushInterval   time.Duration // max time buffered data stays in user space
-	WriteBufSize    int           // bufio size per open file
-	MaxOpenFiles    int           // open file cache size per writer shard
-	IdleTimeout     time.Duration // close files not written for this long
-	FsyncOnClose    bool          // fsync files when they are closed
-	StatsInterval   time.Duration // periodic stats logging, 0 disables
-	LogLevel        string        // debug, info, warn, error
+	Listen          string         // UDP listen address, e.g. ":514"
+	Dir             string         // base directory for <ip>/<hour>.log files
+	Retention       time.Duration  // files older than this are deleted
+	CleanupInterval time.Duration  // how often the retention janitor runs
+	Readers         int            // SO_REUSEPORT sockets / receiver goroutines
+	Writers         int            // writer shards
+	RcvBuf          int            // requested SO_RCVBUF in bytes
+	BatchSize       int            // datagrams per recvmmsg call
+	QueueSize       int            // total in-memory queue capacity (messages), split across writers
+	FlushInterval   time.Duration  // max time buffered data stays in user space
+	WriteBufSize    int            // bufio size per open file
+	MaxOpenFiles    int            // open file cache size per writer shard
+	IdleTimeout     time.Duration  // close files not written for this long
+	FsyncOnClose    bool           // fsync files when they are closed
+	SplitByTag      []netip.Prefix // senders whose files are split by syslog tag (<ip>/<tag>/)
+	StatsInterval   time.Duration  // periodic stats logging, 0 disables
+	LogLevel        string         // debug, info, warn, error
 	ShowVersion     bool
 }
 
@@ -71,6 +74,11 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.IntVar(&c.MaxOpenFiles, "max-open-files", c.MaxOpenFiles, "open file cache size per writer shard")
 	fs.DurationVar(&c.IdleTimeout, "idle-timeout", c.IdleTimeout, "close files that were not written for this long")
 	fs.BoolVar(&c.FsyncOnClose, "fsync-on-close", c.FsyncOnClose, "fsync files when they are closed (rotation, eviction, shutdown)")
+	fs.Func("split-by-tag", "comma-separated IPs/CIDRs whose files are split by syslog tag into <ip>/<tag>/ (e.g. Docker hosts: 127.0.0.1,10.0.0.0/24)", func(v string) error {
+		p, err := ParsePrefixes(v)
+		c.SplitByTag = append(c.SplitByTag, p...)
+		return err
+	})
 	fs.DurationVar(&c.StatsInterval, "stats-interval", c.StatsInterval, "log statistics at this interval (0 disables)")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug, info, warn, error")
 	fs.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
@@ -122,6 +130,42 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("unknown log-level %q", c.LogLevel))
 	}
 	return errors.Join(errs...)
+}
+
+// ParsePrefixes parses a comma-separated list of IP addresses and CIDR
+// prefixes. A bare address becomes a single-host prefix. IPv4-mapped IPv6
+// addresses are turned into IPv4 like the receiver does with sender addresses.
+func ParsePrefixes(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		var p netip.Prefix
+		if strings.Contains(f, "/") {
+			var err error
+			if p, err = netip.ParsePrefix(f); err != nil {
+				return nil, err
+			}
+			if a := p.Addr(); a.Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("%s: IPv4-mapped prefix shorter than /96", f)
+				}
+				p = netip.PrefixFrom(a.Unmap(), p.Bits()-96)
+			}
+			p = p.Masked()
+		} else {
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, err
+			}
+			a = a.Unmap().WithZone("")
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // QueuePerWriter returns the channel capacity of a single writer shard.

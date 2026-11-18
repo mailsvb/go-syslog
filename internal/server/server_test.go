@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,7 +18,7 @@ import (
 	"github.com/mailsvb/go-syslog/internal/config"
 )
 
-func startTestServer(t *testing.T) (*Server, config.Config) {
+func startTestServer(t *testing.T, opts ...func(*config.Config)) (*Server, config.Config) {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Listen = "127.0.0.1:0"
@@ -26,6 +27,9 @@ func startTestServer(t *testing.T) (*Server, config.Config) {
 	cfg.Writers = 2
 	cfg.RcvBuf = 256 << 10 // like an untuned CI runner; send() must cope with it
 	cfg.StatsInterval = 0
+	for _, o := range opts {
+		o(&cfg)
+	}
 	srv, err := Start(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +48,13 @@ const sendWindow = 100
 // received all of them; the test fails if one does not arrive.
 func send(t *testing.T, srv *Server, source string, start, n int) bool {
 	t.Helper()
+	return sendf(t, srv, source, "<134>1 2026-11-18T10:00:00Z host app - - - seq=%d\n", start, n)
+}
+
+// sendf is send with a message format that contains one %d for the sequence.
+// Each call uses its own socket, like each Docker container logger does.
+func sendf(t *testing.T, srv *Server, source, format string, start, n int) bool {
+	t.Helper()
 	c, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(source)}, srv.Addr().(*net.UDPAddr))
 	if err != nil {
 		if source == "127.0.0.1" {
@@ -56,7 +67,7 @@ func send(t *testing.T, srv *Server, source string, start, n int) bool {
 	base := srv.Stats.Received.Load()
 	for sent := 0; sent < n; {
 		for end := min(sent+sendWindow, n); sent < end; sent++ {
-			if _, err := fmt.Fprintf(c, "<134>1 2026-11-18T10:00:00Z host app - - - seq=%d\n", start+sent); err != nil {
+			if _, err := fmt.Fprintf(c, format, start+sent); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -147,5 +158,31 @@ func TestReopenWhileRunning(t *testing.T) {
 	srv.Shutdown()
 	if got := checkFile(t, filepath.Join(cfg.Dir, "127.0.0.1")); got != 20 {
 		t.Fatalf("got %d lines, want 20", got)
+	}
+}
+
+func TestEndToEndSplitByTag(t *testing.T) {
+	srv, cfg := startTestServer(t, func(c *config.Config) {
+		c.SplitByTag = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	})
+	const n = 5000
+	// Docker log driver formats: rfc5424, the default "unix" and rfc3164.
+	sendf(t, srv, "127.0.0.1", "<30>1 2026-11-18T10:00:00.000000Z dockerhost web-1 42 web-1 - seq=%d", 0, n)
+	sendf(t, srv, "127.0.0.1", "<30>Nov 18 10:00:00 db-1[43]: seq=%d", 0, n)
+	sendf(t, srv, "127.0.0.1", "<30>Nov 18 10:00:00 dockerhost app/cache.1[44]: seq=%d", 0, n)
+	srv.Shutdown()
+
+	st := srv.Stats.Snapshot()
+	if st.Written != 3*n || st.DroppedQueueFull != 0 || st.WriteErrors != 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+	host := filepath.Join(cfg.Dir, "127.0.0.1")
+	for _, tag := range []string{"web-1", "db-1", "app_cache.1"} {
+		if got := checkFile(t, filepath.Join(host, tag)); got != n {
+			t.Errorf("%s: %d lines, want %d", tag, got, n)
+		}
+	}
+	if files, _ := filepath.Glob(filepath.Join(host, "*.log")); len(files) != 0 {
+		t.Errorf("split sender also wrote unsplit files: %v", files)
 	}
 }

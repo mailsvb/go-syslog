@@ -6,6 +6,8 @@
 # Extra command line flags for go-syslog. Run "go-syslog -h" for all flags.
 # Defaults: -listen :514 -dir /var/log/go-syslog -retention 168h
 # Example:  GO_SYSLOG_ARGS="-listen 0.0.0.0:514 -retention 72h -writers 8"
+# Docker:   GO_SYSLOG_ARGS="-split-by-tag 127.0.0.1" writes <ip>/<container>/
+#           files for the senders listed (see README, "Docker containers").
 #
 # Note: if you change -dir, also allow writing there:
 #   systemctl edit go-syslog   ->   [Service] ReadWritePaths=/new/dir

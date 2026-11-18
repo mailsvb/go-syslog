@@ -15,8 +15,9 @@ import (
 	"github.com/mailsvb/go-syslog/internal/writer"
 )
 
-// Janitor removes <dir>/<ip>/<YYYY-MM-DD_HH>.log files whose hour ended more
-// than Retention ago and removes sender directories that became empty.
+// Janitor removes <dir>/<ip>/<YYYY-MM-DD_HH>.log and
+// <dir>/<ip>/<tag>/<YYYY-MM-DD_HH>.log files whose hour ended more than
+// Retention ago and removes tag and sender directories that became empty.
 // The age comes from the file name, not from mtime, so touching or copying
 // files does not change when they expire.
 type Janitor struct {
@@ -82,32 +83,59 @@ func (j *Janitor) RunOnce() (int, error) {
 			continue
 		}
 		hostDir := filepath.Join(j.Dir, h.Name())
-		files, err := os.ReadDir(hostDir)
+		n, empty, err := j.clean(hostDir, cutoff, true)
+		deleted += n
 		if err != nil {
 			errs = append(errs, err)
-			continue
 		}
-		remaining := len(files)
-		for _, f := range files {
-			if !Expired(f.Name(), cutoff) || f.IsDir() {
-				continue
-			}
-			if err := os.Remove(filepath.Join(hostDir, f.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, err)
-				continue
-			}
-			remaining--
-			deleted++
-			if j.Stats != nil {
-				j.Stats.FilesDeleted.Add(1)
-			}
-		}
-		if remaining == 0 {
+		if empty {
 			// Fails harmlessly if a writer created a new file in the meantime.
 			_ = os.Remove(hostDir)
 		}
 	}
 	return deleted, errors.Join(errs...)
+}
+
+// clean deletes expired log files in dir. With withTags it also cleans the
+// tag subdirectories (<ip>/<tag>/) and removes those that became empty.
+// empty reports whether dir has nothing left.
+func (j *Janitor) clean(dir string, cutoff time.Time, withTags bool) (deleted int, empty bool, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, false, err
+	}
+	var errs []error
+	remaining := len(entries)
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			if !withTags {
+				continue
+			}
+			n, sub, err := j.clean(path, cutoff, false)
+			deleted += n
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if sub && os.Remove(path) == nil {
+				remaining--
+			}
+			continue
+		}
+		if !Expired(e.Name(), cutoff) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+			continue
+		}
+		remaining--
+		deleted++
+		if j.Stats != nil {
+			j.Stats.FilesDeleted.Add(1)
+		}
+	}
+	return deleted, remaining == 0, errors.Join(errs...)
 }
 
 // Expired reports whether name is a log file whose hour ended before cutoff.

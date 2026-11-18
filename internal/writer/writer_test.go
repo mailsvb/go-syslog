@@ -45,7 +45,7 @@ func TestFilePathAndNormalize(t *testing.T) {
 		{"fe80::1%eth0", "/d/fe80::1/2026-01-02_03.log"},
 	}
 	for _, tt := range tests {
-		got := FilePath("/d", NormalizeAddr(netip.MustParseAddr(tt.ip)), ts)
+		got := FilePath("/d", NormalizeAddr(netip.MustParseAddr(tt.ip)), "", ts)
 		if got != tt.want {
 			t.Errorf("FilePath(%s) = %s, want %s", tt.ip, got, tt.want)
 		}
@@ -94,10 +94,10 @@ func TestShardHourRotation(t *testing.T) {
 	if len(s.files) != 2 {
 		t.Fatalf("expected 2 open files, got %d", len(s.files))
 	}
-	if got := readFile(t, FilePath(o.Dir, ip1, t1)); got != "2026-11-18T13:59:59.000Z a\n" {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", t1)); got != "2026-11-18T13:59:59.000Z a\n" {
 		t.Errorf("hour 13 file = %q", got)
 	}
-	if got := readFile(t, FilePath(o.Dir, ip1, t2)); got != "2026-11-18T14:00:00.000Z b\n" {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", t2)); got != "2026-11-18T14:00:00.000Z b\n" {
 		t.Errorf("hour 14 file = %q", got)
 	}
 	s.closeAll()
@@ -111,11 +111,11 @@ func TestShardBuffersUntilFlush(t *testing.T) {
 	s := newShard(o, 0)
 	ts := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
 	s.handle(msg(ip1, ts, "x"))
-	if got := readFile(t, FilePath(o.Dir, ip1, ts)); got != "" {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); got != "" {
 		t.Fatalf("data written before flush: %q", got)
 	}
 	s.flushDirty()
-	if got := readFile(t, FilePath(o.Dir, ip1, ts)); got == "" {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); got == "" {
 		t.Fatal("data not written after flush")
 	}
 	s.closeAll()
@@ -132,16 +132,16 @@ func TestShardLRUEvictionFlushes(t *testing.T) {
 	if len(s.files) != 2 {
 		t.Fatalf("open files = %d, want 2", len(s.files))
 	}
-	if _, ok := s.files[fileKey{ip1, hourOf(ts)}]; ok {
+	if _, ok := s.files[fileKey{addr: ip1, hour: hourOf(ts)}]; ok {
 		t.Fatal("ip1 should have been evicted")
 	}
-	if got := readFile(t, FilePath(o.Dir, ip1, ts)); !strings.HasSuffix(got, " one\n") {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); !strings.HasSuffix(got, " one\n") {
 		t.Errorf("evicted file not flushed: %q", got)
 	}
 	// Writing to an evicted file reopens it in append mode.
 	s.handle(msg(ip1, ts, "again"))
 	s.closeAll()
-	if got := readFile(t, FilePath(o.Dir, ip1, ts)); strings.Count(got, "\n") != 2 {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); strings.Count(got, "\n") != 2 {
 		t.Errorf("reopened file content = %q", got)
 	}
 }
@@ -161,7 +161,7 @@ func TestShardReapIdle(t *testing.T) {
 	if len(s.files) != 1 {
 		t.Fatalf("open files after reap = %d, want 1", len(s.files))
 	}
-	if _, ok := s.files[fileKey{ip2, hourOf(now)}]; !ok {
+	if _, ok := s.files[fileKey{addr: ip2, hour: hourOf(now)}]; !ok {
 		t.Fatal("ip2 should still be open")
 	}
 	s.closeAll()
@@ -178,7 +178,7 @@ func TestShardRecreatesDeletedDir(t *testing.T) {
 	}
 	s.handle(msg(ip1, ts, "b"))
 	s.closeAll()
-	if got := readFile(t, FilePath(o.Dir, ip1, ts)); !strings.HasSuffix(got, " b\n") {
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); !strings.HasSuffix(got, " b\n") {
 		t.Errorf("content = %q", got)
 	}
 }
@@ -211,7 +211,7 @@ func TestDispatcherOrderAndShutdownFlush(t *testing.T) {
 	}
 	d.Close()
 	for _, a := range addrs {
-		lines := strings.Split(strings.TrimSuffix(readFile(t, FilePath(o.Dir, a, ts)), "\n"), "\n")
+		lines := strings.Split(strings.TrimSuffix(readFile(t, FilePath(o.Dir, a, "", ts)), "\n"), "\n")
 		if len(lines) != n {
 			t.Fatalf("%s: %d lines, want %d", a, len(lines), n)
 		}
@@ -235,7 +235,7 @@ func TestDispatcherFlushInterval(t *testing.T) {
 	d.Dispatch(msg(ip1, ts, "tick"))
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, _ := os.ReadFile(FilePath(o.Dir, ip1, ts)); bytes.Contains(b, []byte("tick")) {
+		if b, _ := os.ReadFile(FilePath(o.Dir, ip1, "", ts)); bytes.Contains(b, []byte("tick")) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)

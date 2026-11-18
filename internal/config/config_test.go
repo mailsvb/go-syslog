@@ -29,6 +29,25 @@ func TestParseFlags(t *testing.T) {
 	}
 }
 
+func TestParseSplitByTag(t *testing.T) {
+	c, err := Parse([]string{"-split-by-tag", "127.0.0.1, ::1,10.1.2.3/24", "-split-by-tag", "::ffff:192.0.2.0/120,fe80::1%eth0"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"127.0.0.1/32", "::1/128", "10.1.2.0/24", "192.0.2.0/24", "fe80::1/128"}
+	if len(c.SplitByTag) != len(want) {
+		t.Fatalf("got %v, want %v", c.SplitByTag, want)
+	}
+	for i, p := range c.SplitByTag {
+		if p.String() != want[i] {
+			t.Errorf("prefix %d = %s, want %s", i, p, want[i])
+		}
+	}
+	if d := Default(); len(d.SplitByTag) != 0 {
+		t.Fatal("split-by-tag must be off by default")
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
 	for _, args := range [][]string{
 		{"-readers", "0"},
@@ -36,6 +55,9 @@ func TestParseInvalid(t *testing.T) {
 		{"-log-level", "loud"},
 		{"-dir", ""},
 		{"extra"},
+		{"-split-by-tag", "10.0.0.0/33"},
+		{"-split-by-tag", "docker-host"},
+		{"-split-by-tag", "::ffff:10.0.0.0/64"},
 	} {
 		if _, err := Parse(args, io.Discard); err == nil {
 			t.Errorf("Parse(%v) succeeded, want error", args)

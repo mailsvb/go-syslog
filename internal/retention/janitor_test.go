@@ -80,6 +80,39 @@ func TestRunOnce(t *testing.T) {
 	}
 }
 
+func TestRunOnceTagDirs(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 11, 18, 12, 30, 0, 0, time.UTC)
+	oldOnly := filepath.Join(dir, "127.0.0.1", "web-1", "2026-11-10_08.log")
+	oldMixed := filepath.Join(dir, "127.0.0.1", "db-1", "2026-11-10_08.log")
+	keepMixed := filepath.Join(dir, "127.0.0.1", "db-1", "2026-11-18_12.log")
+	allOld := filepath.Join(dir, "10.0.0.9", "gone", "2026-11-01_00.log")
+	deep := filepath.Join(dir, "10.0.0.8", "a", "b", "2026-11-01_00.log") // not a layout we write
+	for _, p := range []string{oldOnly, oldMixed, keepMixed, allOld, deep} {
+		touch(t, p)
+	}
+	j := &Janitor{Dir: dir, Retention: 7 * 24 * time.Hour, Now: func() time.Time { return now }}
+	n, err := j.RunOnce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("deleted %d, want 3", n)
+	}
+	if exists(filepath.Dir(oldOnly)) {
+		t.Error("empty tag dir not removed")
+	}
+	if exists(oldMixed) || !exists(keepMixed) {
+		t.Error("wrong files deleted in tag dir")
+	}
+	if exists(filepath.Join(dir, "10.0.0.9")) {
+		t.Error("host dir with only expired tag dirs not removed")
+	}
+	if !exists(deep) {
+		t.Error("files below unknown nesting must be left alone")
+	}
+}
+
 func TestRunOnceMissingDir(t *testing.T) {
 	j := &Janitor{Dir: filepath.Join(t.TempDir(), "nope"), Retention: time.Hour}
 	if n, err := j.RunOnce(); n != 0 || err != nil {

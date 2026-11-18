@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -37,6 +38,7 @@ func Start(ctx context.Context, cfg config.Config, log *slog.Logger) (*Server, e
 		FlushInterval: cfg.FlushInterval,
 		IdleTimeout:   cfg.IdleTimeout,
 		FsyncOnClose:  cfg.FsyncOnClose,
+		SplitByTag:    cfg.SplitByTag,
 		Stats:         st,
 		Logger:        log,
 	})
@@ -69,7 +71,8 @@ func Start(ctx context.Context, cfg config.Config, log *slog.Logger) (*Server, e
 
 	recv.Start()
 	log.Info("listening", "addr", recv.Addr().String(), "readers", cfg.Readers,
-		"writers", cfg.Writers, "dir", cfg.Dir, "retention", cfg.Retention.String())
+		"writers", cfg.Writers, "dir", cfg.Dir, "retention", cfg.Retention.String(),
+		"split_by_tag", fmt.Sprint(cfg.SplitByTag))
 	return s, nil
 }
 
