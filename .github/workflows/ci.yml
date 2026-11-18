@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Lint
+        run: make lint
+      - name: Test
+        run: make test
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      NFPM_VERSION: v2.48.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Build linux/amd64 binary
+        run: make build VERSION=0.0.0
+      - name: Build RPM (unsigned, smoke test)
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}
+          make rpm VERSION=0.0.0
+      - name: Install RPM on openSUSE Leap
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" registry.opensuse.org/opensuse/leap:16.0 sh -ec '
+            zypper --non-interactive --no-gpg-checks install --allow-unsigned-rpm /dist/go-syslog-*.rpm
+            go-syslog -version
+            id gosyslog
+            ls -ld /var/log/go-syslog
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-syslog-linux-amd64
+          path: |
+            dist/go-syslog
+            dist/*.rpm

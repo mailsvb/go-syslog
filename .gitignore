@@ -1,0 +1,7 @@
+/dist/
+/out/
+/go-syslog
+*.rpm
+*.test
+*.out
+.DS_Store
