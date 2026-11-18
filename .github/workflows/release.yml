@@ -1,7 +1,8 @@
 name: release
 
 # Manual release: Actions -> release -> Run workflow -> enter a version (X.Y.Z).
-# Builds the RPM, adds it to the zypper repository (newest 5 RPMs kept),
+# Builds the go-syslog and go-syslog-view RPMs (same version), adds them to the
+# zypper repository (newest 5 RPMs per package kept),
 # deploys the repository to GitHub Pages (Pages source: "GitHub Actions") and
 # creates the GitHub release vX.Y.Z. The gh-pages branch only stores the
 # repository contents so the next release can carry the older RPMs over.
@@ -73,7 +74,7 @@ jobs:
           echo "SIGN_KEY_ID=$key_id" >> "$GITHUB_ENV"
           echo "NFPM_RPM_KEY_FILE=$key_file" >> "$GITHUB_ENV"
 
-      - name: Build RPM
+      - name: Build RPMs
         env:
           NFPM_RPM_PASSPHRASE: ${{ secrets.PACKAGE_SIGNING_PASSPHRASE }}
         run: make rpm VERSION="$VERSION"
@@ -90,7 +91,8 @@ jobs:
           if git fetch -q origin gh-pages; then
             git archive FETCH_HEAD x86_64 2>/dev/null | tar -x -C site || true
           fi
-          scripts/update-repo.sh site "$base_url" "$KEEP_RPMS" dist/go-syslog-"$VERSION"-*.rpm
+          scripts/update-repo.sh site "$base_url" "$KEEP_RPMS" \
+            dist/go-syslog-"$VERSION"-*.rpm dist/go-syslog-view-"$VERSION"-*.rpm
           echo "BASE_URL=$base_url" >> "$GITHUB_ENV"
 
       - name: Upload Pages artifact
@@ -115,9 +117,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v$VERSION" dist/go-syslog-"$VERSION"-*.rpm \
+          gh release create "v$VERSION" dist/go-syslog-"$VERSION"-*.rpm dist/go-syslog-view-"$VERSION"-*.rpm \
             --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes \
-            --notes "Install: zypper addrepo ${BASE_URL}go-syslog.repo && zypper install go-syslog"
+            --notes "Install: zypper addrepo ${BASE_URL}go-syslog.repo && zypper install go-syslog (optional: go-syslog-view)"
 
   deploy-pages:
     needs: release

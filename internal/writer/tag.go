@@ -15,6 +15,34 @@ const (
 	Untagged = "_untagged"
 )
 
+// ParseTag returns the syslog tag (RFC 3164 TAG or RFC 5424 APP-NAME) of the
+// raw message b as a subslice of b, or nil if there is none. It is the parser
+// the writer uses for -split-by-tag senders, exported for read-side tools.
+func ParseTag(b []byte) []byte {
+	start, end := parseTag(b)
+	if start == end {
+		return nil
+	}
+	return b[start:end]
+}
+
+// ValidTagDir reports whether name can be a tag directory written by the
+// writer: 1 to MaxTagLen bytes of [A-Za-z0-9._-], and not ".", ".." or "-".
+func ValidTagDir(name string) bool {
+	if name == Untagged {
+		return true
+	}
+	if len(name) == 0 || len(name) > MaxTagLen || isUntaggedName([]byte(name)) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if tagByte(name[i]) != name[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // parseTag returns the position [start, end) of the syslog tag in b, or
 // (0, 0) if there is none. It understands RFC 5424 (APP-NAME) and RFC 3164
 // with or without HOSTNAME, which covers Docker's "unix" (default),

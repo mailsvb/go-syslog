@@ -33,23 +33,28 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - name: Build linux/amd64 binary
+      - name: Build linux/amd64 binaries
         run: make build VERSION=0.0.0
-      - name: Build RPM (unsigned, smoke test)
+      - name: Build RPMs (unsigned, smoke test)
         run: |
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@${NFPM_VERSION}
           make rpm VERSION=0.0.0
-      - name: Install RPM on openSUSE Leap
+      - name: Install RPMs on openSUSE Leap
         run: |
           docker run --rm -v "$PWD/dist:/dist:ro" registry.opensuse.org/opensuse/leap:16.0 sh -ec '
             zypper --non-interactive --no-gpg-checks install --allow-unsigned-rpm /dist/go-syslog-*.rpm
             go-syslog -version
+            go-syslog-view -version
             id gosyslog
-            ls -ld /var/log/go-syslog
+            id gosyslog-view
+            ls -ld /var/log/go-syslog /etc/go-syslog-view
+            test -s /etc/go-syslog-view/token
+            stat -c "%a %U:%G" /etc/go-syslog-view/token | grep -qx "640 root:gosyslog-view"
           '
       - uses: actions/upload-artifact@v7
         with:
           name: go-syslog-linux-amd64
           path: |
             dist/go-syslog
+            dist/go-syslog-view
             dist/*.rpm

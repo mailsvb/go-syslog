@@ -1,0 +1,41 @@
+[Unit]
+Description=go-syslog-view read-only MCP server for go-syslog logs
+Documentation=https://github.com/mailsvb/go-syslog
+After=network.target
+
+[Service]
+Type=simple
+User=gosyslog-view
+Group=gosyslog-view
+# Read access to /var/log/go-syslog (files 0640, directories 0750, group gosyslog).
+SupplementaryGroups=gosyslog
+EnvironmentFile=-/etc/sysconfig/go-syslog-view
+ExecStart=/usr/bin/go-syslog-view $GO_SYSLOG_VIEW_ARGS
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+
+# Hardening: the service only reads files and serves HTTP on a high port.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

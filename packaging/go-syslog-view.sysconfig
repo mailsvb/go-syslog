@@ -1,0 +1,16 @@
+## Path:        System/Logging
+## Description: go-syslog-view read-only MCP server
+## Type:        string
+## Default:     "-token-file /etc/go-syslog-view/token"
+#
+# Command line flags for go-syslog-view. Run "go-syslog-view -h" for all flags.
+# Defaults: -listen :8514 -dir /var/log/go-syslog
+# The MCP endpoint is http://<host>:8514/mcp (plain HTTP, no TLS).
+#
+# The package creates a random bearer token in /etc/go-syslog-view/token on
+# first install. Clients send it as "Authorization: Bearer <token>".
+# Remove -token-file to turn authentication off (anyone who can reach the
+# port can then read all logs).
+#
+# Example: GO_SYSLOG_VIEW_ARGS="-listen 192.168.21.12:8514 -token-file /etc/go-syslog-view/token"
+GO_SYSLOG_VIEW_ARGS="-token-file /etc/go-syslog-view/token"

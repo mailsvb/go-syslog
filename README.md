@@ -10,6 +10,7 @@ A small, fast UDP syslog collector for Linux written in Go.
   Control characters inside a message are escaped rsyslog-style (`#012` for a newline), so every message stays on one line.
 - Deletes files older than **7 days** automatically.
 - Ships as an RPM for linux/x86_64 through a zypper repository on GitHub Pages.
+- Optional second package **go-syslog-view**: a read-only MCP server over HTTP, so AI agents can list, count and search the collected logs. See [MCP server for AI agents](#mcp-server-for-ai-agents-go-syslog-view).
 
 The receive and write path borrows the techniques that make rsyslog and syslog-ng fast and reliable:
 
@@ -132,6 +133,64 @@ The service logs a `stats` line every minute with these counters:
 
 If `dropped_queue_full` grows, the disk can't keep up: raise `-queue-size` or `-writers`. Drops inside the kernel show up as `RcvbufErrors` in `netstat -su` (or `/proc/net/snmp`). When those grow, check that the log line `socket receive buffer` reports the requested size, and raise `-readers`.
 
+## MCP server for AI agents (go-syslog-view)
+
+`go-syslog-view` is a separate program that reads the files in `/var/log/go-syslog` and serves them to AI agents as an [MCP](https://modelcontextprotocol.io) server over plain HTTP (streamable HTTP, stateless, JSON responses). It never writes to the log directory and does not touch the collector, so a slow query or a bug in it cannot cost the collector a message. It is built and released together with go-syslog, with the same version.
+
+```bash
+zypper install go-syslog-view
+systemctl enable --now go-syslog-view
+cat /etc/go-syslog-view/token      # bearer token, created on first install
+```
+
+The endpoint is `http://<host>:8514/mcp`. Clients must send `Authorization: Bearer <token>`. There is no TLS, so keep the port inside your LAN or VPN.
+
+| Path | Purpose |
+|---|---|
+| `/usr/bin/go-syslog-view` | the server |
+| `/usr/lib/systemd/system/go-syslog-view.service` | systemd unit; runs as user `gosyslog-view` with the supplementary group `gosyslog`, which gives read access to the logs |
+| `/etc/sysconfig/go-syslog-view` | `GO_SYSLOG_VIEW_ARGS`, default `-token-file /etc/go-syslog-view/token` |
+| `/etc/go-syslog-view/token` | random token (mode 0640, root:gosyslog-view); replace it with your own if you like and restart the service |
+
+Flags (`go-syslog-view -h`):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-listen` | `:8514` | HTTP listen address |
+| `-dir` | `/var/log/go-syslog` | log directory of go-syslog |
+| `-token-file` | (none) | file with the bearer token; without it there is no authentication and a warning is logged |
+| `-max-scan-bytes` | `1073741824` | bytes one request may read before it returns a partial result with a cursor |
+| `-max-scan-time` | `20s` | time one request may scan before it returns a partial result with a cursor |
+| `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
+
+Tools (all read-only):
+
+| Tool | What it does |
+|---|---|
+| `list_sources` | senders (`<ip>`) and tags of split senders (`<ip>/<tag>`) with file count, size, oldest hour and last write; also the server time |
+| `log_stats` | lines per source (or source and hour) in a time range, per severity, first/last time and the most frequent apps (syslog tags) |
+| `search_logs` | lines by source, time range, minimum severity, case-insensitive text and/or RE2 regex; newest first by default, paged with `next_cursor`, limited by `limit` and `max_bytes` |
+| `get_context` | the lines before and after a line returned by `search_logs` (by its `ref`) |
+
+Times accept RFC 3339 or a duration before now such as `30m`, `6h` or `2d`; the default range is the last 24 hours. Results are kept small on purpose (50 lines and about 32 KB per page by default, messages clipped at 1000 bytes), so an agent starts with `log_stats` and narrows down instead of reading whole files.
+
+Connect Claude Code (or any MCP client that speaks streamable HTTP):
+
+```bash
+claude mcp add --transport http go-syslog http://loghost:8514/mcp \
+  --header "Authorization: Bearer $(ssh loghost sudo cat /etc/go-syslog-view/token)"
+```
+
+Try it with curl (stateless, so no initialize call is needed):
+
+```bash
+curl -s http://loghost:8514/mcp -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"log_stats","arguments":{"from":"6h"}}}'
+```
+
+`GET /healthz` returns `ok` without authentication.
+
 ## Development
 
 Requires Go 1.27+. The target platform is linux/amd64. Tests also run on macOS.
@@ -139,14 +198,18 @@ Requires Go 1.27+. The target platform is linux/amd64. Tests also run on macOS.
 ```bash
 make test                   # go test -race ./...
 make lint                   # gofmt, go vet, staticcheck
-make build                  # dist/go-syslog (linux/amd64, static)
-make rpm VERSION=1.2.3      # dist/go-syslog-1.2.3-1.x86_64.rpm (needs nfpm)
+make build                  # dist/go-syslog and dist/go-syslog-view (linux/amd64, static, same version)
+make rpm VERSION=1.2.3      # dist/go-syslog-1.2.3-1.x86_64.rpm and dist/go-syslog-view-1.2.3-1.x86_64.rpm (needs nfpm)
 ```
 
 Try it locally on an unprivileged port:
 
 ```bash
 go run ./cmd/go-syslog -listen 127.0.0.1:5514 -dir ./out
+```
+
+```bash
+go run ./cmd/go-syslog-view -listen 127.0.0.1:8514 -dir ./out    # MCP at http://127.0.0.1:8514/mcp
 ```
 
 ```bash
@@ -159,8 +222,8 @@ printf '<13>hello\n' | nc -u -w1 127.0.0.1 5514    # macOS / anywhere
 
 ## CI and releases
 
-- **ci** (`.github/workflows/ci.yml`) runs on every push to `main` and on pull requests. It runs lint and race tests, builds the binary and an unsigned test RPM, installs that RPM in an openSUSE container, and uploads the binary and RPM as artifacts.
-- **release** (`.github/workflows/release.yml`) runs manually from *Actions → release → Run workflow* with a version `X.Y.Z`. It tests and builds the RPM, adds it to the zypper repository on the `gh-pages` branch, keeps the **newest 5** RPMs, rebuilds the repository metadata, force-pushes a single commit and creates the GitHub release `vX.Y.Z`.
+- **ci** (`.github/workflows/ci.yml`) runs on every push to `main` and on pull requests. It runs lint and race tests, builds both binaries and unsigned test RPMs (go-syslog and go-syslog-view), installs them in an openSUSE container, and uploads the binaries and RPMs as artifacts.
+- **release** (`.github/workflows/release.yml`) runs manually from *Actions → release → Run workflow* with a version `X.Y.Z`. It tests and builds both RPMs with that version, adds them to the zypper repository on the `gh-pages` branch, keeps the **newest 5** RPMs of each package, rebuilds the repository metadata, force-pushes a single commit and creates the GitHub release `vX.Y.Z`.
 
 One-time setup:
 

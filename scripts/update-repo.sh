@@ -5,7 +5,7 @@
 #
 #   site-dir  directory that holds the repository (existing RPMs in x86_64/)
 #   base-url  public URL of the repository, e.g. https://owner.github.io/go-syslog/
-#   keep      number of RPMs to keep (the newest by version)
+#   keep      number of RPMs to keep per package (the newest by version)
 #
 # If SIGN_KEY_ID is set, repodata/repomd.xml is signed with that GPG key
 # (GPG_PASSPHRASE optional) and the public key is published next to it.
@@ -20,14 +20,20 @@ pkgdir="$site/x86_64"
 mkdir -p "$pkgdir"
 cp -f "$@" "$pkgdir/"
 
-# Keep only the newest $keep packages (version sort).
-mapfile -t all < <(find "$pkgdir" -maxdepth 1 -name 'go-syslog-*.rpm' -printf '%f\n' | sort -V)
-if (( ${#all[@]} > keep )); then
-    for f in "${all[@]:0:${#all[@]}-keep}"; do
-        echo "pruning $f"
-        rm -f -- "$pkgdir/$f"
-    done
-fi
+# Keep only the newest $keep RPMs of each package (go-syslog, go-syslog-view).
+# The package name is the file name without "-<version>-<release>.<arch>.rpm".
+mapfile -t names < <(find "$pkgdir" -maxdepth 1 -name '*.rpm' -printf '%f\n' |
+    sed -E 's/-[^-]+-[^-]+\.[^.]+\.rpm$//' | sort -u)
+for name in "${names[@]}"; do
+    mapfile -t all < <(find "$pkgdir" -maxdepth 1 -name "$name-*.rpm" -printf '%f\n' |
+        grep -E "^${name//./\\.}-[0-9][^-]*-[^-]+\.[^.]+\.rpm$" | sort -V)
+    if (( ${#all[@]} > keep )); then
+        for f in "${all[@]:0:${#all[@]}-keep}"; do
+            echo "pruning $f"
+            rm -f -- "$pkgdir/$f"
+        done
+    fi
+done
 
 rm -rf -- "$site/repodata"
 createrepo_c --quiet "$site"
@@ -66,8 +72,9 @@ touch "$site/.nojekyll"
     echo '<h1>go-syslog zypper repository</h1>'
     echo "<pre>zypper addrepo ${base_url}go-syslog.repo
 zypper refresh
-zypper install go-syslog</pre><h2>Packages</h2><ul>"
-    find "$pkgdir" -maxdepth 1 -name 'go-syslog-*.rpm' -printf '%f\n' | sort -rV | while read -r f; do
+zypper install go-syslog
+zypper install go-syslog-view    # optional: read-only MCP server</pre><h2>Packages</h2><ul>"
+    find "$pkgdir" -maxdepth 1 -name '*.rpm' -printf '%f\n' | sort -rV | while read -r f; do
         echo "<li><a href=\"x86_64/$f\">$f</a></li>"
     done
     echo '</ul></body></html>'

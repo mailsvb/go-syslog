@@ -1,6 +1,7 @@
 /dist/
 /out/
 /go-syslog
+/go-syslog-view
 *.rpm
 *.test
 *.out
