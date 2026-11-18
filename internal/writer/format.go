@@ -46,9 +46,40 @@ func appendEscaped(dst, b []byte) []byte {
 	return dst
 }
 
-// appendTimestamp appends t in UTC using TimestampLayout.
+// appendTimestamp appends t in UTC using TimestampLayout. It writes the fixed
+// layout by hand, which is several times faster than time.AppendFormat.
 func appendTimestamp(dst []byte, t time.Time) []byte {
-	return t.UTC().AppendFormat(dst, TimestampLayout)
+	t = t.UTC()
+	year, month, day := t.Date()
+	if year < 0 || year > 9999 {
+		return t.AppendFormat(dst, TimestampLayout)
+	}
+	hour, minute, sec := t.Clock()
+	ms := t.Nanosecond() / int(time.Millisecond)
+	var b [len("2006-01-02T15:04:05.000Z")]byte
+	put2(b[0:], year/100)
+	put2(b[2:], year%100)
+	b[4] = '-'
+	put2(b[5:], int(month))
+	b[7] = '-'
+	put2(b[8:], day)
+	b[10] = 'T'
+	put2(b[11:], hour)
+	b[13] = ':'
+	put2(b[14:], minute)
+	b[16] = ':'
+	put2(b[17:], sec)
+	b[19] = '.'
+	b[20] = byte('0' + ms/100)
+	put2(b[21:], ms%100)
+	b[23] = 'Z'
+	return append(dst, b[:]...)
+}
+
+// put2 writes v (0-99) as two decimal digits.
+func put2(b []byte, v int) {
+	b[0] = byte('0' + v/10)
+	b[1] = byte('0' + v%10)
 }
 
 // FormatLine returns the complete line written for a message. The writer uses

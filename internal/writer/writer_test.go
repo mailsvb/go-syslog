@@ -287,3 +287,54 @@ func BenchmarkShardHandle(b *testing.B) {
 	}
 	s.closeAll()
 }
+
+func FuzzAppendTimestamp(f *testing.F) {
+	f.Add(int64(0), int64(0))
+	f.Add(time.Date(2026, 11, 18, 23, 59, 59, 999999999, time.UTC).Unix(), int64(999999999))
+	f.Add(int64(-62135596800), int64(1))   // year 1
+	f.Add(int64(253402300799), int64(5e8)) // 9999-12-31T23:59:59
+	f.Fuzz(func(t *testing.T, sec, nsec int64) {
+		ts := time.Unix(sec, nsec%1e9).In(time.FixedZone("X", 5*3600))
+		want := ts.UTC().AppendFormat(nil, TimestampLayout)
+		if got := appendTimestamp([]byte("pre"), ts); string(got) != "pre"+string(want) {
+			t.Fatalf("appendTimestamp(%v) = %q, want %q", ts, got[3:], want)
+		}
+	})
+}
+
+func BenchmarkAppendTimestamp(b *testing.B) {
+	ts := time.Now()
+	buf := make([]byte, 0, 64)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buf = appendTimestamp(buf[:0], ts)
+	}
+}
+
+// The shard caches the last written file; eviction and reaping must drop it.
+func TestShardLastFileCache(t *testing.T) {
+	o := testOptions(t)
+	o.MaxOpenFiles = 1
+	s := newShard(o, 0)
+	ts := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		s.handle(msg(ip1, ts, "a"))
+		s.handle(msg(ip1, ts, "b"))
+		s.handle(msg(ip2, ts, "c")) // evicts ip1, which was the cached file
+	}
+	s.reap(ts.Add(time.Hour)) // closes ip2, the cached file
+	if s.last != nil || len(s.files) != 0 {
+		t.Fatalf("after reap: last=%v files=%d", s.last, len(s.files))
+	}
+	s.handle(msg(ip2, ts, "d"))
+	s.closeAll()
+	if got := readFile(t, FilePath(o.Dir, ip1, "", ts)); strings.Count(got, "\n") != 6 {
+		t.Errorf("ip1 file = %q", got)
+	}
+	if got := readFile(t, FilePath(o.Dir, ip2, "", ts)); strings.Count(got, "\n") != 4 {
+		t.Errorf("ip2 file = %q", got)
+	}
+	if st := o.Stats.Snapshot(); st.Written != 10 {
+		t.Errorf("written = %d, want 10", st.Written)
+	}
+}

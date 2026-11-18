@@ -211,6 +211,11 @@ type shard struct {
 	tags  map[string]string // raw tag -> sanitized tag (interned)
 	lru   *list.List        // front = most recently written
 	dirty []*openFile
+	last  *openFile // most recently written file (front of lru), or nil
+
+	// Counters owned by this goroutine, added to Options.Stats once per
+	// batch instead of once per message (shared atomics are contended).
+	written, bytes uint64
 
 	scratch    []byte
 	lastTime   time.Time
@@ -256,8 +261,10 @@ func (s *shard) run() {
 					break drain
 				}
 			}
+			s.publishStats()
 			s.flushDirty() // queue drained: end of transaction
 		case <-t.C:
+			s.publishStats()
 			s.flushDirty()
 			s.reap(s.o.Now())
 		case reply := <-s.ctl:
@@ -271,17 +278,20 @@ func (s *shard) run() {
 func (s *shard) handle(m Message) {
 	defer bufpool.Put(m.Data)
 	key := fileKey{addr: m.Addr, tag: s.tagOf(m), hour: hourOf(m.Time)}
-	of := s.files[key]
-	if of == nil {
-		var err error
-		of, err = s.open(key, m.Time)
-		if err != nil {
-			s.o.Stats.WriteErrors.Add(1)
-			s.logErr("open failed", FilePath(s.o.Dir, key.addr, key.tag, m.Time), err)
-			return
+	of := s.last
+	if of == nil || of.key != key {
+		// Not the same file as the previous message: look it up.
+		if of = s.files[key]; of == nil {
+			var err error
+			if of, err = s.open(key, m.Time); err != nil {
+				s.o.Stats.WriteErrors.Add(1)
+				s.logErr("open failed", FilePath(s.o.Dir, key.addr, key.tag, m.Time), err)
+				return
+			}
+		} else {
+			s.lru.MoveToFront(of.elem)
 		}
-	} else {
-		s.lru.MoveToFront(of.elem)
+		s.last = of
 	}
 
 	n, err := s.writeLine(of.w, m)
@@ -291,13 +301,24 @@ func (s *shard) handle(m Message) {
 		s.close(of)
 		return
 	}
-	of.lastWrite = s.o.Now()
+	// The receive time (one clock read per reader batch) is exact enough
+	// for the idle timeout and saves a clock read per message.
+	of.lastWrite = m.Time
 	if !of.dirty {
 		of.dirty = true
 		s.dirty = append(s.dirty, of)
 	}
-	s.o.Stats.Written.Add(1)
-	s.o.Stats.BytesWritten.Add(uint64(n))
+	s.written++
+	s.bytes += uint64(n)
+}
+
+// publishStats adds the shard's local counters to the shared Stats.
+func (s *shard) publishStats() {
+	if s.written != 0 {
+		s.o.Stats.Written.Add(s.written)
+		s.o.Stats.BytesWritten.Add(s.bytes)
+		s.written, s.bytes = 0, 0
+	}
 }
 
 // tagOf returns the directory name for the tag of m ("" if m is not split).
@@ -398,6 +419,9 @@ func (s *shard) close(of *openFile) {
 		s.o.Stats.WriteErrors.Add(1)
 		s.logErr("close failed", of.path, err)
 	}
+	if s.last == of {
+		s.last = nil
+	}
 	s.lru.Remove(of.elem)
 	delete(s.files, of.key)
 	s.o.Stats.FilesClosed.Add(1)
@@ -418,6 +442,7 @@ func (s *shard) reap(now time.Time) {
 }
 
 func (s *shard) closeAll() {
+	s.publishStats()
 	for e := s.lru.Back(); e != nil; {
 		prev := e.Prev()
 		s.close(e.Value.(*openFile))
